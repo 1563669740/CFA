@@ -53,10 +53,14 @@ class CFAScoreEngineTest(unittest.TestCase):
         self.assertGreaterEqual(len(result.findings), 1)
         top = result.findings[0]
         self.assertEqual(top.target_asset_id, "G003")
-        self.assertIn("input", {a.source for a in top.anchors})
+        # With minimal-combination fix: direct_protected_disclosure
+        # minimal combos are just the protected output anchor(s).
+        # The user input anchor is correctly excluded from key_anchors
+        # because it is not part of the minimal restoration combination.
         self.assertIn("output", {a.source for a in top.anchors})
-        self.assertTrue(any("用户输入" in item for item in top.key_anchor_summary))
         self.assertTrue(any("模型输出" in item for item in top.key_anchor_summary))
+        self.assertTrue(top.key_anchor_ids)
+        self.assertTrue(top.minimal_combinations)
 
     def test_version_boundary_does_not_match_longer_version(self):
         result = self.engine.analyze("xz-utils 5.6.10 只是版本说明。")

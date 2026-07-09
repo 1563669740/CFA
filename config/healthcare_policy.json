@@ -2,6 +2,7 @@
   "uniqueness_k": 1,
   "display_field": "patient_name",
   "protected_fields": [
+    "patient_name",
     "diagnosis",
     "medication",
     "insurance_level"
@@ -228,6 +229,12 @@
       "values": ["肿瘤科"],
       "implies": {}
     }
+  ],
+  "sensitive_fields": [
+    "patient_name",
+    "diagnosis",
+    "medication",
+    "insurance_level"
   ],
   "safe_replacements": {
     "patient_name": "某患者",

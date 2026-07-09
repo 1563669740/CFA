@@ -152,6 +152,9 @@ class FieldPolicy:
     safe_replacements: Dict[str, str] = field(default_factory=dict)
     safe_hint: str = ""
 
+    # ---- 显式敏感字段池（额外补充，可与 protected/id/display 自动合并） ----
+    sensitive_fields: List[str] = field(default_factory=list)
+
     # ---- v2.3 间接还原检测配置 ----
     indirect_restoration_enabled: bool = True
     min_candidate_reduction: int = 1
@@ -191,6 +194,7 @@ class FieldPolicy:
             display_field=str(data.get("display_field", "system_name")),
             safe_replacements=dict(data.get("safe_replacements", {})),
             safe_hint=str(data.get("safe_hint", "")),
+            sensitive_fields=list(data.get("sensitive_fields", [])),
             # v2.3
             indirect_restoration_enabled=bool(data.get("indirect_restoration_enabled", True)),
             min_candidate_reduction=int(data.get("min_candidate_reduction", 1)),

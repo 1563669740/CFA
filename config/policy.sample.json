@@ -94,5 +94,12 @@
     "disposition_status": "相关处置状态",
     "remote_entry": "远程入口"
   },
+  "sensitive_fields": [
+    "system_name",
+    "component_version",
+    "risk_status",
+    "disposition_status",
+    "remote_entry"
+  ],
   "safe_hint": "具体资产名称、系统类型、组件版本和处置状态应通过授权资产管理系统查询。"
 }

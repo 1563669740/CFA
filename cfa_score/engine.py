@@ -2,6 +2,7 @@
 
 import itertools
 import math
+from itertools import combinations
 from collections import Counter
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
@@ -602,6 +603,188 @@ class CFAScoreEngine:
         return restored
 
     # ==================================================================
+    # v2.3 — Minimal restoration combination search
+    # ==================================================================
+
+    def _minimal_restoration_combinations(
+        self,
+        input_anchors: list[Anchor],
+        output_anchors: list[Anchor],
+        anchor_by_id: Dict[str, Anchor],
+        decision: RestorationDecision,
+        *,
+        max_combo_size: int = 6,
+        max_results: int = 30,
+    ) -> list[list[Anchor]]:
+        """
+        Find inclusion-minimal anchor combinations that are sufficient to trigger
+        the same restoration decision.
+
+        A valid combination must contain at least one output anchor, otherwise the
+        risk is caused by user input alone and should not be attributed to model output.
+        """
+
+        usable_inputs = [
+            a for a in self._unique_filters(input_anchors)
+            if not a.inferred
+        ]
+
+        usable_outputs = [
+            a for a in self._unique_filters(output_anchors)
+            if a.source == "output" and not a.inferred
+        ]
+
+        if not usable_outputs:
+            return []
+
+        # Direct protected disclosure is special:
+        # each directly disclosed protected output anchor is itself a minimal combo.
+        if decision.trigger_type == "direct_protected_disclosure":
+            return [
+                [a]
+                for a in usable_outputs
+                if a.protected
+            ][:max_results]
+
+        pool = usable_inputs + usable_outputs
+        output_ids = {a.id for a in usable_outputs}
+
+        minimal: list[list[Anchor]] = []
+        minimal_id_sets: list[frozenset[str]] = []
+
+        upper = min(max_combo_size, len(pool))
+
+        for size in range(1, upper + 1):
+            for combo_tuple in combinations(pool, size):
+                combo = list(combo_tuple)
+                combo_ids = frozenset(a.id for a in combo)
+
+                # The model output must contribute at least one anchor.
+                if not (combo_ids & output_ids):
+                    continue
+
+                # If an already accepted smaller minimal combo is contained in this
+                # combo, this combo is not minimal.
+                if any(prev.issubset(combo_ids) for prev in minimal_id_sets):
+                    continue
+
+                if self._combo_triggers_same_restoration(
+                    combo,
+                    anchor_by_id,
+                    decision,
+                ):
+                    minimal.append(combo)
+                    minimal_id_sets.append(combo_ids)
+
+                    if len(minimal) >= max_results:
+                        return minimal
+
+        return minimal
+
+    # ==================================================================
+    # v2.3 — Combination trigger check
+    # ==================================================================
+
+    def _combo_triggers_same_restoration(
+        self,
+        combo: list[Anchor],
+        anchor_by_id: Dict[str, Anchor],
+        decision: RestorationDecision,
+    ) -> bool:
+        """
+        Check whether a candidate anchor combination is sufficient to trigger
+        the same restoration type as the global decision.
+        """
+
+        combo_inputs = [
+            a for a in combo
+            if a.source == "input"
+        ]
+
+        combo_outputs = [
+            a for a in combo
+            if a.source == "output" and not a.inferred
+        ]
+
+        if not combo_outputs:
+            return False
+
+        input_candidates = self._filter_candidates(
+            list(self.assets),
+            combo_inputs,
+            anchor_by_id,
+        )
+
+        if not input_candidates:
+            return False
+
+        final_candidates = self._filter_candidates(
+            input_candidates,
+            combo_outputs,
+            anchor_by_id,
+        )
+
+        if not final_candidates:
+            return False
+
+        input_count = len(input_candidates)
+        final_count = len(final_candidates)
+
+        # Output must actually reduce the candidate set.
+        # Otherwise the restoration is already caused by user input alone.
+        if final_count >= input_count:
+            return False
+
+        information_gain_bits = math.log2(input_count / final_count)
+
+        if decision.trigger_type == "indirect_asset_restoration":
+            return (
+                final_count <= self.policy.uniqueness_k
+                and (input_count - final_count) >= self.policy.min_candidate_reduction
+                and information_gain_bits >= self.policy.min_information_gain_bits
+            )
+
+        if decision.trigger_type == "indirect_protected_value_restoration":
+            restored_fields = self._find_restored_protected_fields(
+                input_candidates,
+                final_candidates,
+            )
+
+            if not restored_fields:
+                return False
+
+            expected = set(decision.restored_fields or self.policy.protected_fields)
+            return bool(set(restored_fields) & expected)
+
+        return False
+
+    # ==================================================================
+    # v2.3 — Key anchor summary helper
+    # ==================================================================
+
+    def _summarize_key_anchors(
+        self,
+        anchors: Sequence[Anchor],
+    ) -> list[str]:
+        summary: list[str] = []
+        seen = set()
+
+        for a in anchors:
+            item = (
+                f"{self._source_label(a.source)}/"
+                f"{a.field_label}:"
+                f"{a.effective_canonical_value()}"
+            )
+
+            if item in seen:
+                continue
+
+            seen.add(item)
+            summary.append(item)
+
+        return summary
+
+    # ==================================================================
     # v2.3 — Scoring for indirect restoration
     # ==================================================================
 
@@ -686,6 +869,53 @@ class CFAScoreEngine:
         if not target_assets and decision.trigger_type == "direct_protected_disclosure":
             target_assets = list(self.assets)
 
+        # Compute minimal restoration combinations
+        minimal_combos = self._minimal_restoration_combinations(
+            snapshot.input_anchors,
+            snapshot.output_anchors,
+            anchor_by_id,
+            decision,
+        )
+
+        if minimal_combos:
+            minimal_combinations = [
+                [a.id for a in combo]
+                for combo in minimal_combos
+            ]
+
+            key_anchors: list[Anchor] = []
+            seen_anchor_ids = set()
+
+            for combo in minimal_combos:
+                for a in combo:
+                    if a.id in seen_anchor_ids:
+                        continue
+                    seen_anchor_ids.add(a.id)
+                    key_anchors.append(a)
+
+            key_anchor_ids_all = [a.id for a in key_anchors]
+            key_summary_dedup = self._summarize_key_anchors(key_anchors)
+
+            key_output_anchors = [
+                a for a in key_anchors
+                if a.source == "output"
+            ]
+
+        else:
+            # Fallback: keep old behavior only if minimal search fails.
+            # This prevents breaking existing demo behavior.
+            minimal_combinations = []
+
+            key_anchors = (
+                list(snapshot.input_anchors)
+                + list(snapshot.contributing_output_anchors)
+            )
+
+            key_anchor_ids_all = [a.id for a in key_anchors]
+            key_summary_dedup = self._summarize_key_anchors(key_anchors)
+
+            key_output_anchors = list(snapshot.contributing_output_anchors)
+
         # When final_candidates is empty but detection triggered (e.g.
         # direct disclosure), use input_candidates count for scoring
         # so that findings are not LOW-filtered.
@@ -701,32 +931,12 @@ class CFAScoreEngine:
             final_candidates=effective_final,
             input_anchors=snapshot.input_anchors,
             output_anchors=snapshot.output_anchors,
-            contributing_output_anchors=snapshot.contributing_output_anchors,
+            contributing_output_anchors=key_output_anchors,
             information_gain_bits=effective_ig,
         )
 
-        # Build key anchor summary including both input AND contributing output anchors
-        key_summary: List[str] = []
-        for a in snapshot.input_anchors:
-            key_summary.append(
-                f"{self._source_label(a.source)}/{a.field_label}:{a.effective_canonical_value()}"
-            )
-        for a in snapshot.contributing_output_anchors:
-            key_summary.append(
-                f"{self._source_label(a.source)}/{a.field_label}:{a.effective_canonical_value()}"
-            )
-        # Deduplicate while preserving order
-        seen_keys = set()
-        key_summary_dedup: List[str] = []
-        for ks in key_summary:
-            if ks not in seen_keys:
-                seen_keys.add(ks)
-                key_summary_dedup.append(ks)
-
-        key_anchor_ids_all = [a.id for a in snapshot.input_anchors] + [a.id for a in snapshot.contributing_output_anchors]
-
         for asset in target_assets:
-            matching_anchors = self._anchors_matching_asset(asset, all_anchors, anchor_by_id)
+            matching_anchors = self._anchors_matching_asset(asset, key_anchors, anchor_by_id)
             chain = self._reduction_chain(matching_anchors, anchor_by_id)
 
             score = self._score_restoration(effective_snapshot, decision)
@@ -746,7 +956,7 @@ class CFAScoreEngine:
                     restored_fact=self._restored_fact(asset, matching_anchors),
                     anchors=matching_anchors,
                     reduction_chain=chain,
-                    minimal_combinations=[],
+                    minimal_combinations=minimal_combinations,
                     key_anchor_ids=key_anchor_ids_all,
                     key_anchor_summary=key_summary_dedup,
                     finding_type=decision.trigger_type,
@@ -896,6 +1106,81 @@ class CFAScoreEngine:
         return {"input": "用户输入", "output": "模型输出"}.get(source, source)
 
     # ==================================================================
+    # Unified extraction helper (used by both first pass and secondary check)
+    # ==================================================================
+
+    def _extract_anchors_for_pass(
+        self,
+        *,
+        user_input: str,
+        model_output: str,
+    ) -> List[Anchor]:
+        """Extract anchors for one CFA analysis pass.
+
+        Important:
+        - Always run rule-based extraction on BOTH user_input and model_output.
+        - LLM extraction is optional.
+        - If LLM extraction fails, fall back to rule anchors, not empty anchors.
+        - This helper must be used by both the first pass and the secondary pass.
+        """
+
+        segments: List[Tuple[str, str]] = []
+
+        if user_input and user_input.strip():
+            segments.append(("input", user_input))
+
+        segments.append(("output", model_output or ""))
+
+        # 1. Rule-based anchors: always include input + output
+        rule_anchors = self.rule_extractor.extract_segments(
+            segments,
+            self.assets,
+        )
+
+        # 2. LLM anchors: optional recall enhancement
+        llm_anchors: List[Anchor] = []
+
+        if self._mode == ExtractionMode.RULE_PLUS_LLM and self._llm_extractor is not None:
+            try:
+                raw_input_anchors: list[Anchor] = []
+                raw_output_anchors: list[Anchor] = []
+
+                if user_input and user_input.strip():
+                    raw_input_anchors = self._llm_extractor.extract_segment(
+                        text=user_input,
+                        source="input",
+                    )
+
+                if model_output and model_output.strip():
+                    raw_output_anchors = self._llm_extractor.extract_segment(
+                        text=model_output,
+                        source="output",
+                    )
+
+                if self._verifier is not None:
+                    verified_input = self._verifier.verify_segment_all(
+                        raw_input_anchors,
+                        source_text=user_input,
+                        expected_source="input",
+                    )
+
+                    verified_output = self._verifier.verify_segment_all(
+                        raw_output_anchors,
+                        source_text=model_output,
+                        expected_source="output",
+                    )
+
+                    llm_anchors = verified_input + verified_output
+                else:
+                    llm_anchors = raw_input_anchors + raw_output_anchors
+
+            except Exception:
+                # LLM extraction failure must not remove rule-based input anchors.
+                llm_anchors = []
+
+        return AnchorMerger.merge(rule_anchors, llm_anchors)
+
+    # ==================================================================
     # Main analyze entry point
     # ==================================================================
 
@@ -907,57 +1192,12 @@ class CFAScoreEngine:
         do_secondary_check: bool = False,
     ) -> AnalysisResult:
         """Run the full CFA-Score analysis pipeline."""
-        segments = []
-        if user_input:
-            segments.append(("input", user_input))
-        segments.append(("output", model_output))
 
-        # Step 1: Rule-based extraction
-        rule_anchors = self.rule_extractor.extract_segments(segments, self.assets)
-
-        # Step 2: LLM semantic extraction (Mode 2/3) — per-segment, source-isolated
-        llm_anchors: List[Anchor] = []
-        if self._mode == ExtractionMode.RULE_PLUS_LLM and self._llm_extractor is not None:
-            try:
-                # Input segment — independent recall + extraction + verification
-                raw_input_anchors: list[Anchor] = []
-                if user_input.strip():
-                    raw_input_anchors = self._llm_extractor.extract_segment(
-                        text=user_input,
-                        source="input",
-                    )
-                else:
-                    raw_input_anchors = []
-
-                # Output segment — independent recall + extraction + verification
-                raw_output_anchors: list[Anchor] = []
-                if model_output.strip():
-                    raw_output_anchors = self._llm_extractor.extract_segment(
-                        text=model_output,
-                        source="output",
-                    )
-                else:
-                    raw_output_anchors = []
-
-                if self._verifier is not None:
-                    input_anchors = self._verifier.verify_segment_all(
-                        raw_input_anchors,
-                        source_text=user_input,
-                        expected_source="input",
-                    )
-                    output_anchors = self._verifier.verify_segment_all(
-                        raw_output_anchors,
-                        source_text=model_output,
-                        expected_source="output",
-                    )
-                    llm_anchors = input_anchors + output_anchors
-                else:
-                    llm_anchors = raw_input_anchors + raw_output_anchors
-            except Exception:
-                llm_anchors = []
-
-        # Step 3: Merge anchors
-        all_anchors = AnchorMerger.merge(rule_anchors, llm_anchors)
+        # Step 1-3: Extract and merge anchors for the first pass
+        all_anchors = self._extract_anchors_for_pass(
+            user_input=user_input,
+            model_output=model_output,
+        )
 
         # Step 4: Build findings (v2.3 snapshot-based)
         findings = self._build_findings(all_anchors)
@@ -973,46 +1213,33 @@ class CFAScoreEngine:
 
         if do_secondary_check and findings and self._llm_rewriter_client is not None:
             secondary_performed = True
+
             try:
                 llm_rewritten = self._llm_safe_rewrite(
                     raw_answer=model_output,
                     findings=findings,
                 )
-                re_anchors = self.rule_extractor.extract_segments(
-                    [("output", llm_rewritten)], self.assets
+
+                # Critical fix:
+                # Re-run the full CFA extraction pipeline on:
+                # original user_input + rewritten model_output.
+                re_anchors = self._extract_anchors_for_pass(
+                    user_input=user_input,
+                    model_output=llm_rewritten,
                 )
-                if self._llm_extractor is not None:
-                    try:
-                        re_raw_input = self._llm_extractor.extract_segment(
-                            text=user_input,
-                            source="input",
-                        ) if user_input.strip() else []
-                        re_raw_output = self._llm_extractor.extract_segment(
-                            text=llm_rewritten,
-                            source="output",
-                        ) if llm_rewritten.strip() else []
-                        if self._verifier is not None:
-                            re_input = self._verifier.verify_segment_all(
-                                re_raw_input,
-                                source_text=user_input,
-                                expected_source="input",
-                            )
-                            re_output = self._verifier.verify_segment_all(
-                                re_raw_output,
-                                source_text=llm_rewritten,
-                                expected_source="output",
-                            )
-                            re_llm = re_input + re_output
-                            re_anchors = AnchorMerger.merge(re_anchors, re_llm)
-                    except Exception:
-                        pass
+
                 secondary_findings = self._build_findings(re_anchors)
+
                 if secondary_findings:
                     secondary_safe = _FALLBACK_SAFE_ANSWER
                 else:
                     secondary_safe = llm_rewritten
+
             except Exception:
+                # If rewrite or secondary check fails, do not release the LLM
+                # rewritten answer.  Keep deterministic sanitizer output.
                 secondary_safe = safe
+                secondary_findings = []
 
         return AnalysisResult(
             raw_answer=model_output,

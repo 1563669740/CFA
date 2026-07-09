@@ -50,6 +50,28 @@ class AnswerSanitizer:
             return set(self._policy.identifier_fields)
         return {"system_name", "business_domain", "environment", "function_category"}
 
+    def _effective_sensitive_field_names(self) -> set:
+        """Return the effective set of sensitive field names that must be redacted.
+
+        Priority:
+        1. If policy.sensitive_fields is explicitly provided, use it.
+        2. Otherwise, auto-compute: protected_fields ∪ identifier_fields ∪ {display_field}.
+
+        This makes the sanitizer fully policy-driven — no hard-coded field names.
+        """
+        if not self._policy:
+            return set()
+
+        if self._policy.sensitive_fields:
+            return set(self._policy.sensitive_fields)
+
+        # Fallback: union of protected + identifier + display
+        names: set[str] = set(self._policy.protected_fields)
+        names.update(self._policy.identifier_fields)
+        if self._policy.display_field:
+            names.add(self._policy.display_field)
+        return names
+
     # ----------------------------------------------------------------
 
     def make_x_replaced(self, raw_answer: str, findings: Sequence[RiskFinding]) -> str:
@@ -64,6 +86,10 @@ class AnswerSanitizer:
                 findings,
                 x_mode=True,
             )
+
+            # Fallback: replace target_asset_name (e.g. patient_name=王芳) with "X"
+            # even if it was not included in dangerous_output_anchors.
+            text = self._redact_target_asset_names(text, findings, x_mode=True)
 
             # 如果存在无法定位到原文片段的高风险语义锚点，直接退回 X 摘要。
             # 这样可以避免"看起来改写了，但语义线索还残留"的情况。
@@ -88,6 +114,14 @@ class AnswerSanitizer:
                 findings,
                 x_mode=False,
             )
+
+            # Fallback: replace target_asset_name (e.g. patient_name=王芳) with safe
+            # replacement even if it was not included in dangerous_output_anchors.
+            text = self._redact_target_asset_names(text, findings, x_mode=False)
+
+            # Post-normalize to eliminate repeated safe placeholders
+            # (e.g. "相关治疗方案相关治疗方案治疗" → "相关治疗方案")
+            text = self._post_normalize_safe_text(text)
 
             # 严格兜底：如果危险锚点是语义抽取出来的，但无法在文本中可靠替换，
             # 不再放行原回答，而是返回字段级安全摘要。
@@ -606,13 +640,14 @@ class AnswerSanitizer:
     def _dangerous_output_anchors(self, findings: Sequence[RiskFinding]) -> List[Anchor]:
         """Collect dangerous output anchors for sanitization.
 
-        v2.3: Also includes contributing locator anchors (quasi-identifiers
-        that actually narrowed the candidate set) in addition to direct
-        protected field disclosures.
+        v2.4: Uses policy.sensitive_fields (or its auto-computed fallback) to
+        determine which field disclosures are direct-sensitive.  Also includes
+        contributing locator anchors (quasi-identifiers that actually narrowed
+        the candidate set).
         """
         anchors: List[Anchor] = []
         seen = set()
-        id_fields = self._identifier_field_names()
+        sensitive_fields = self._effective_sensitive_field_names()
 
         for finding in findings:
             if finding.risk_level not in {"MEDIUM", "HIGH", "CRITICAL"}:
@@ -629,13 +664,11 @@ class AnswerSanitizer:
                 if self._is_already_safe_placeholder(anchor):
                     continue
 
-                # Direct sensitive disclosure
-                is_display = (
-                    self._policy is not None
-                    and anchor.field_name == self._policy.display_field
+                # Direct sensitive disclosure — driven by policy-sensitive fields
+                is_direct_sensitive = (
+                    anchor.protected
+                    or anchor.field_name in sensitive_fields
                 )
-                is_id_field = anchor.field_name in id_fields
-                is_direct_sensitive = anchor.protected or is_id_field or is_display
 
                 # v2.3: Contributing locator anchor (quasi-identifier that
                 # actually narrowed the candidate set)
@@ -681,6 +714,86 @@ class AnswerSanitizer:
         if re.search(r"[A-Za-z0-9]", term):
             return rf"(?<![A-Za-z0-9_.-]){escaped}(?![A-Za-z0-9_.-])"
         return escaped
+
+    # ---------- target_asset_name fallback redaction ----------
+
+    def _redact_target_asset_names(
+        self,
+        text: str,
+        findings: Sequence[RiskFinding],
+        *,
+        x_mode: bool = False,
+    ) -> str:
+        """Fallback: replace target_asset_name in the text when display_field is
+        a sensitive field.
+
+        Gated by policy.sensitive_fields (or auto-computed fallback): only
+        replaces when the display_field belongs to the effective sensitive set.
+        This avoids over-redacting benign display values like product_name or
+        department_name that may be public in some domains.
+
+        For each finding, if target_asset_name is a non-trivial, non-placeholder
+        string that still appears in the text, replace it with the safe replacement
+        (or "X" in x_mode).
+        """
+        if not self._policy or not self._policy.display_field:
+            return text
+
+        display_field = self._policy.display_field
+        sensitive_fields = self._effective_sensitive_field_names()
+
+        # Gate: only redact if display_field is actually sensitive
+        if display_field not in sensitive_fields:
+            return text
+
+        safe_display = self._safe_replacement(display_field)
+
+        for finding in findings:
+            target_name = getattr(finding, "target_asset_name", None)
+            if not target_name:
+                continue
+            target_name = str(target_name).strip()
+            if not target_name:
+                continue
+            # Skip if it's already a safe placeholder
+            if self._text_is_safe_value(target_name, display_field):
+                continue
+
+            replacement = "X" if x_mode else safe_display
+            text = self._replace_literal(text, target_name, replacement)
+
+        return text
+
+    # ---------- post-normalization (deduplicate repeated safe placeholders) ----------
+
+    def _post_normalize_safe_text(self, text: str) -> str:
+        """Policy-driven normalization to deduplicate repeated safe placeholders.
+
+        Uses the policy's safe_replacements values to build normalization
+        patterns, so it works across domains without hard-coded placeholder text.
+
+        Examples:
+            "相关治疗方案相关治疗方案治疗" → "相关治疗方案"
+            "某企业某企业" → "某企业"
+        """
+        # Build dynamic normalization patterns from the policy's safe_replacements
+        safe_values: set[str] = set()
+        if self._policy and self._policy.safe_replacements:
+            safe_values.update(self._policy.safe_replacements.values())
+
+        for safe_value in sorted(safe_values, key=len, reverse=True):
+            if len(safe_value) <= 2:
+                continue
+            escaped = re.escape(safe_value)
+            # Collapse 2+ consecutive repetitions
+            text = re.sub(rf"({escaped}){{2,}}", safe_value, text)
+
+        # Generic fallback: collapse any 相关* placeholder repeated 2+ times
+        text = re.sub(r"(相关[^\s。，,；;]{1,8})(?:\1)+", r"\1", text)
+
+        return text
+
+    # ---------- hint append ----------
 
     def _append_authorized_query_hint(self, text: str) -> str:
         hint = self._safe_hint()

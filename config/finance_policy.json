@@ -191,6 +191,13 @@
       }
     }
   ],
+  "sensitive_fields": [
+    "company_name",
+    "loan_amount",
+    "interest_rate",
+    "credit_rating",
+    "collateral"
+  ],
   "safe_replacements": {
     "company_name": "某企业",
     "industry": "相关行业",

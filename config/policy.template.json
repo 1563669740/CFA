@@ -1,0 +1,53 @@
+﻿{
+  "display_field": "name",
+  "uniqueness_k": 1,
+  "protected_fields": [
+    "restricted_fact",
+    "restricted_status"
+  ],
+  "identifier_fields": [
+    "scene",
+    "scope",
+    "public_trait"
+  ],
+  "field_order": [
+    "scene",
+    "scope",
+    "public_trait",
+    "restricted_fact",
+    "restricted_status"
+  ],
+  "field_labels": {
+    "name": "事实对象",
+    "scene": "输入关键词条",
+    "scope": "范围锚点",
+    "public_trait": "公开线索锚点",
+    "restricted_fact": "受限事实",
+    "restricted_status": "受限状态"
+  },
+  "field_weights": {
+    "scene": 0.15,
+    "scope": 0.15,
+    "public_trait": 0.2,
+    "restricted_fact": 0.35,
+    "restricted_status": 0.25
+  },
+  "field_aliases": {
+    "scene": {
+      "范围关键词A": ["用户说法A", "关键词A"]
+    },
+    "restricted_status": {
+      "受限状态A": ["状态别名A", "可推断状态A"]
+    }
+  },
+  "public_rules": [
+    {
+      "name": "模拟 LLM/公开知识推断规则",
+      "field": "public_trait",
+      "values": ["公开线索A"],
+      "implies": {
+        "restricted_status": "受限状态A"
+      }
+    }
+  ]
+}

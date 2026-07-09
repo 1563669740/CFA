@@ -1,0 +1,37 @@
+{
+  "description": "公开金融知识规则，用于模拟 LLM 或公开资料可推断出的信贷关系。",
+  "rules": [
+    {
+      "name": "5亿元以上并购贷款通常对应AA-以上评级的大型标的",
+      "field": "loan_amount",
+      "values": ["人民币5.0亿元"],
+      "implies": {
+        "industry": "数据中心/云计算"
+      }
+    },
+    {
+      "name": "LPR+220bp的房地产项目贷款为高风险资产",
+      "field": "interest_rate",
+      "values": ["年化5.65%"],
+      "implies": {
+        "credit_rating": "BB"
+      }
+    },
+    {
+      "name": "技术改造贷款通常针对高端制造企业",
+      "field": "loan_type",
+      "values": ["技术改造贷款"],
+      "implies": {
+        "industry": "高端装备制造"
+      }
+    },
+    {
+      "name": "应收账款质押流动资金贷款通常有稳定国企回款",
+      "field": "collateral",
+      "values": ["应收账款质押"],
+      "implies": {
+        "credit_rating": "A"
+      }
+    }
+  ]
+}

@@ -1,0 +1,255 @@
+{
+  "uniqueness_k": 1,
+  "display_field": "patient_name",
+  "protected_fields": [
+    "diagnosis",
+    "medication",
+    "insurance_level"
+  ],
+  "identifier_fields": [
+    "patient_name"
+  ],
+  "quasi_identifier_fields": [
+    "department",
+    "ward_type",
+    "condition_summary",
+    "admission_date",
+    "doctor"
+  ],
+  "field_order": [
+    "department",
+    "ward_type",
+    "condition_summary",
+    "patient_name",
+    "diagnosis",
+    "medication",
+    "insurance_level",
+    "admission_date",
+    "doctor"
+  ],
+  "field_labels": {
+    "patient_name": "患者姓名",
+    "department": "科室",
+    "ward_type": "病房类型",
+    "condition_summary": "病情简述",
+    "diagnosis": "诊断结果",
+    "medication": "用药方案",
+    "insurance_level": "医保类型",
+    "admission_date": "入院日期",
+    "doctor": "主治医生"
+  },
+  "field_weights": {
+    "patient_name": 0.30,
+    "department": 0.10,
+    "ward_type": 0.15,
+    "condition_summary": 0.20,
+    "diagnosis": 0.30,
+    "medication": 0.28,
+    "insurance_level": 0.22,
+    "admission_date": 0.08,
+    "doctor": 0.12
+  },
+  "field_aliases": {
+    "ward_type": {
+      "ICU": [
+        "重症监护",
+        "重症监护室",
+        "ICU病房",
+        "重症"
+      ],
+      "特需病房": [
+        "特需",
+        "VIP病房",
+        "高端病房"
+      ],
+      "普通病房": [
+        "普通",
+        "一般病房",
+        "标准病房"
+      ]
+    },
+    "department": {
+      "心内科": [
+        "心脏内科",
+        "心血管内科",
+        "心脏科"
+      ],
+      "肿瘤科": [
+        "肿瘤内科",
+        "癌症中心"
+      ],
+      "神经科": [
+        "神经内科",
+        "神经病学"
+      ],
+      "骨科": [
+        "骨外科",
+        "创伤骨科"
+      ]
+    },
+    "condition_summary": {
+      "急性心梗介入术后": [
+        "急性心梗",
+        "急性心梗介入",
+        "心梗介入术后",
+        "心梗介入",
+        "心梗做完介入"
+      ],
+      "胸痛待查": [
+        "胸痛",
+        "胸痛检查"
+      ],
+      "心悸查因": [
+        "心悸",
+        "心律失常"
+      ],
+      "脑卒中术后观察": [
+        "脑卒中术后",
+        "卒中术后",
+        "脑梗术后"
+      ],
+      "化疗后观察": [
+        "化疗后的",
+        "化疗观察"
+      ],
+      "骨折术后康复": [
+        "骨折术后",
+        "骨折康复"
+      ],
+      "心衰加重": [
+        "心衰",
+        "心功能不全加重"
+      ],
+      "肿瘤复查": [
+        "复查肿瘤",
+        "癌症复查"
+      ]
+    },
+    "medication": {
+      "替格瑞洛 90mg bid + 阿司匹林 100mg qd + 美托洛尔 25mg bid": [
+        "替格瑞洛",
+        "阿司匹林",
+        "替格瑞洛联合阿司匹林",
+        "替格瑞洛联合阿司匹林的双抗方案",
+        "双抗方案",
+        "双抗",
+        "替格瑞洛联合阿司匹林的双抗"
+      ],
+      "阿司匹林 100mg qd + 阿托伐他汀 20mg qn": [
+        "阿司匹林联合阿托伐他汀",
+        "阿司匹林+他汀"
+      ],
+      "华法林 3mg qd（INR目标2.0-3.0）": [
+        "华法林",
+        "华法林抗凝",
+        "华法林治疗"
+      ],
+      "依达拉奉 30mg bid + 丁苯酞 25mg tid": [
+        "依达拉奉",
+        "丁苯酞",
+        "依达拉奉联合丁苯酞",
+        "脑保护治疗"
+      ],
+      "曲妥珠单抗 6mg/kg q3w + 帕妥珠单抗 420mg q3w": [
+        "曲妥珠单抗",
+        "帕妥珠单抗",
+        "曲妥珠单抗联合帕妥珠单抗",
+        "双靶向",
+        "双靶方案",
+        "靶向治疗"
+      ],
+      "塞来昔布 200mg bid + 低分子肝素 4000IU qd": [
+        "塞来昔布",
+        "低分子肝素"
+      ],
+      "呋塞米 40mg iv bid + 地高辛 0.125mg qd + 沙库巴曲缬沙坦 50mg bid": [
+        "呋塞米",
+        "地高辛",
+        "沙库巴曲缬沙坦",
+        "心衰治疗"
+      ],
+      "奥希替尼 80mg qd": [
+        "奥希替尼",
+        "靶向药奥希替尼"
+      ]
+    },
+    "insurance_level": {
+      "自费": [
+        "自付",
+        "全自费",
+        "无医保"
+      ],
+      "城镇职工医保": [
+        "职工医保",
+        "城市职工"
+      ],
+      "城镇居民医保": [
+        "居民医保",
+        "城市居民"
+      ],
+      "商业保险（高端医疗险）": [
+        "商保",
+        "商业险",
+        "高端医疗险"
+      ],
+      "大病医保": [
+        "大病保险",
+        "重大疾病医保"
+      ]
+    },
+    "doctor": {
+      "李主任": [
+        "李医生",
+        "李教授"
+      ],
+      "赵主任": [
+        "赵医生",
+        "赵教授"
+      ],
+      "王主任": [
+        "王医生"
+      ],
+      "陈主任": [
+        "陈医生",
+        "陈教授"
+      ]
+    }
+  },
+  "public_rules": [
+    {
+      "name": "ICU患者普遍使用抗凝或强效药物",
+      "field": "ward_type",
+      "values": ["ICU"],
+      "implies": {}
+    },
+    {
+      "name": "肿瘤科靶向药物对应特定基因分型",
+      "field": "department",
+      "values": ["肿瘤科"],
+      "implies": {}
+    }
+  ],
+  "safe_replacements": {
+    "patient_name": "某患者",
+    "department": "相关科室",
+    "ward_type": "相关病区",
+    "condition_summary": "相关病情",
+    "diagnosis": "相关诊断",
+    "medication": "相关治疗方案",
+    "insurance_level": "相关医保",
+    "admission_date": "相关日期",
+    "doctor": "主治医生"
+  },
+  "safe_hint": "具体患者姓名、诊断结果、用药方案和医保类型应通过授权HIS系统查询。",
+  "match_type_weights": {
+    "exact": 1.00,
+    "alias": 0.90,
+    "semantic": 0.80,
+    "partial": 0.65,
+    "inferred": 0.70,
+    "ambiguous": 0.45
+  },
+  "llm_confidence_threshold": 0.40,
+  "llm_max_accepted_values": 30,
+  "llm_extraction_fields": ["diagnosis", "medication", "insurance_level", "ward_type"]
+}

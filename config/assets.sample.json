@@ -1,0 +1,46 @@
+[
+  {
+    "id": "G001",
+    "system_name": "遥测数据接收平台",
+    "business_domain": "航天测控",
+    "environment": "生产区",
+    "function_category": "遥测接收服务",
+    "component_version": "xz-utils 5.4.6",
+    "risk_status": "未受影响",
+    "disposition_status": "已确认",
+    "remote_entry": "无公开远程入口"
+  },
+  {
+    "id": "G002",
+    "system_name": "任务指挥协同平台",
+    "business_domain": "航天指挥",
+    "environment": "办公网",
+    "function_category": "任务协同服务",
+    "component_version": "xz-utils 5.4.5",
+    "risk_status": "未受影响",
+    "disposition_status": "已确认",
+    "remote_entry": "普通办公入口"
+  },
+  {
+    "id": "G003",
+    "system_name": "星箭链路健康监测平台",
+    "business_domain": "航天测控",
+    "environment": "生产区",
+    "function_category": "链路健康监测类服务",
+    "component_version": "xz-utils 5.6.1",
+    "risk_status": "高危",
+    "disposition_status": "回滚未完成",
+    "remote_entry": "SSH 运维入口"
+  },
+  {
+    "id": "G004",
+    "system_name": "地面站日志分析平台",
+    "business_domain": "运维审计",
+    "environment": "测试区",
+    "function_category": "日志分析服务",
+    "component_version": "xz-utils 5.6.0",
+    "risk_status": "高危",
+    "disposition_status": "已隔离",
+    "remote_entry": "SSH 运维入口"
+  }
+]

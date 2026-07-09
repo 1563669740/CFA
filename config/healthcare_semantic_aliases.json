@@ -1,0 +1,227 @@
+{
+  "description": "LLM离线生成的语义别名库 —— 用于从模型输出召回候选字段值",
+  "semantic_aliases": {
+    "medication": {
+      "替格瑞洛 90mg bid + 阿司匹林 100mg qd + 美托洛尔 25mg bid": {
+        "components": ["替格瑞洛", "阿司匹林", "美托洛尔"],
+        "aliases": [
+          "双抗方案",
+          "双抗",
+          "双联抗血小板治疗",
+          "DAPT",
+          "P2Y12抑制剂联合阿司匹林",
+          "β受体阻滞剂治疗",
+          "抗血小板联合β受体阻滞剂"
+        ],
+        "partial_clues": [
+          "替格瑞洛",
+          "阿司匹林",
+          "美托洛尔",
+          "β受体阻滞剂",
+          "抗血小板",
+          "双抗",
+          "双联"
+        ],
+        "possible_inferences": [
+          {
+            "from": "双抗方案",
+            "may_imply": "急性冠脉综合征或PCI术后相关治疗"
+          },
+          {
+            "from": "β受体阻滞剂",
+            "may_imply": "心梗后二级预防用药"
+          }
+        ],
+        "partial_match_policy": "any_component_or_alias"
+      },
+      "阿司匹林 100mg qd + 阿托伐他汀 20mg qn": {
+        "components": ["阿司匹林", "阿托伐他汀"],
+        "aliases": [
+          "阿司匹林联合他汀",
+          "阿司匹林+他汀",
+          "抗血小板+降脂"
+        ],
+        "partial_clues": ["阿司匹林", "他汀", "阿托伐他汀"],
+        "possible_inferences": [],
+        "partial_match_policy": "any_component_or_alias"
+      },
+      "华法林 3mg qd（INR目标2.0-3.0）": {
+        "components": ["华法林"],
+        "aliases": [
+          "华法林抗凝",
+          "口服抗凝药",
+          "维生素K拮抗剂",
+          "华法林治疗"
+        ],
+        "partial_clues": ["华法林", "INR", "抗凝"],
+        "possible_inferences": [
+          {
+            "from": "华法林抗凝",
+            "may_imply": "房颤卒中预防或机械瓣膜术后"
+          }
+        ],
+        "partial_match_policy": "any_component_or_alias"
+      },
+      "依达拉奉 30mg bid + 丁苯酞 25mg tid": {
+        "components": ["依达拉奉", "丁苯酞"],
+        "aliases": [
+          "脑保护治疗",
+          "神经保护剂",
+          "卒中后神经保护"
+        ],
+        "partial_clues": ["依达拉奉", "丁苯酞", "脑保护"],
+        "possible_inferences": [],
+        "partial_match_policy": "any_component_or_alias"
+      },
+      "曲妥珠单抗 6mg/kg q3w + 帕妥珠单抗 420mg q3w": {
+        "components": ["曲妥珠单抗", "帕妥珠单抗"],
+        "aliases": [
+          "双靶向",
+          "双靶方案",
+          "靶向治疗",
+          "HER2双靶治疗",
+          "双靶向治疗"
+        ],
+        "partial_clues": ["曲妥珠单抗", "帕妥珠单抗", "靶向", "双靶"],
+        "possible_inferences": [
+          {
+            "from": "双靶方案",
+            "may_imply": "HER2阳性乳腺癌"
+          },
+          {
+            "from": "靶向治疗",
+            "may_imply": "肿瘤靶向药物"
+          }
+        ],
+        "partial_match_policy": "any_component_or_alias"
+      },
+      "呋塞米 40mg iv bid + 地高辛 0.125mg qd + 沙库巴曲缬沙坦 50mg bid": {
+        "components": ["呋塞米", "地高辛", "沙库巴曲缬沙坦"],
+        "aliases": [
+          "心衰标准治疗",
+          "心衰GDMT",
+          "利尿+强心+ARNI",
+          "心衰优化治疗"
+        ],
+        "partial_clues": ["呋塞米", "地高辛", "沙库巴曲缬沙坦", "ARNI", "利尿"],
+        "possible_inferences": [
+          {
+            "from": "心衰标准治疗",
+            "may_imply": "射血分数降低型心衰"
+          }
+        ],
+        "partial_match_policy": "any_component_or_alias"
+      },
+      "奥希替尼 80mg qd": {
+        "components": ["奥希替尼"],
+        "aliases": [
+          "三代EGFR-TKI",
+          "靶向药奥希替尼",
+          "EGFR靶向药"
+        ],
+        "partial_clues": ["奥希替尼", "EGFR", "TKI"],
+        "possible_inferences": [
+          {
+            "from": "奥希替尼",
+            "may_imply": "EGFR突变阳性非小细胞肺癌"
+          }
+        ],
+        "partial_match_policy": "any_component_or_alias"
+      }
+    },
+    "diagnosis": {
+      "急性广泛前壁心肌梗死（Killip II级）": {
+        "components": ["急性心肌梗死", "广泛前壁", "Killip II"],
+        "aliases": [
+          "急性心梗",
+          "广泛前壁心梗",
+          "STEMI",
+          "心梗Killip II"
+        ],
+        "partial_clues": ["心梗", "心肌梗死", "Killip", "前壁"],
+        "possible_inferences": [
+          {
+            "from": "急性心梗介入术后",
+            "may_imply": "急性冠脉综合征"
+          }
+        ],
+        "partial_match_policy": "any_component_or_alias"
+      },
+      "慢性心力衰竭急性失代偿（LVEF 32%，NT-proBNP 5800pg/mL）": {
+        "components": ["心力衰竭", "LVEF", "NT-proBNP"],
+        "aliases": [
+          "心衰加重",
+          "心衰急性发作",
+          "急性心衰",
+          "射血分数降低型心衰"
+        ],
+        "partial_clues": ["心衰", "LVEF", "射血分数", "NT-proBNP"],
+        "possible_inferences": [],
+        "partial_match_policy": "any_component_or_alias"
+      }
+    },
+    "ward_type": {
+      "ICU": {
+        "components": ["ICU"],
+        "aliases": [
+          "重症监护",
+          "重症监护室",
+          "ICU病房",
+          "重症",
+          "加护病房",
+          "特护病房"
+        ],
+        "partial_clues": ["ICU", "重症", "监护"],
+        "possible_inferences": [
+          {
+            "from": "ICU",
+            "may_imply": "危重症患者，病情较重"
+          }
+        ],
+        "partial_match_policy": "any_component_or_alias"
+      },
+      "特需病房": {
+        "components": ["特需"],
+        "aliases": [
+          "VIP病房",
+          "高端病房",
+          "特需医疗"
+        ],
+        "partial_clues": ["特需", "VIP", "高端"],
+        "possible_inferences": [
+          {
+            "from": "特需病房",
+            "may_imply": "自费或商业保险患者"
+          }
+        ],
+        "partial_match_policy": "any_component_or_alias"
+      }
+    },
+    "insurance_level": {
+      "自费": {
+        "components": ["自费"],
+        "aliases": [
+          "自付",
+          "全自费",
+          "无医保",
+          "完全自费"
+        ],
+        "partial_clues": ["自费", "自付"],
+        "possible_inferences": [],
+        "partial_match_policy": "any_component_or_alias"
+      },
+      "商业保险（高端医疗险）": {
+        "components": ["商业保险", "高端医疗"],
+        "aliases": [
+          "商保",
+          "商业险",
+          "高端医疗险",
+          "高端商保"
+        ],
+        "partial_clues": ["商保", "商业险", "高端医疗", "商业保险"],
+        "possible_inferences": [],
+        "partial_match_policy": "any_component_or_alias"
+      }
+    }
+  }
+}

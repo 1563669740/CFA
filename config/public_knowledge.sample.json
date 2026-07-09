@@ -1,0 +1,16 @@
+﻿{
+  "description": "公开知识规则，用于模拟 LLM 或公开资料可推断出的事实关系。",
+  "rules": [
+    {
+      "name": "CVE-2024-3094 affected XZ Utils versions",
+      "field": "component_version",
+      "values": [
+        "xz-utils 5.6.0",
+        "xz-utils 5.6.1"
+      ],
+      "implies": {
+        "risk_status": "高危"
+      }
+    }
+  ]
+}

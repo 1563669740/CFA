@@ -1,0 +1,218 @@
+{
+  "uniqueness_k": 1,
+  "display_field": "company_name",
+  "protected_fields": [
+    "loan_amount",
+    "interest_rate",
+    "credit_rating",
+    "collateral"
+  ],
+  "identifier_fields": [
+    "company_name"
+  ],
+  "quasi_identifier_fields": [
+    "industry",
+    "loan_type",
+    "branch",
+    "application_date",
+    "reviewer"
+  ],
+  "field_order": [
+    "industry",
+    "company_name",
+    "loan_type",
+    "branch",
+    "loan_amount",
+    "interest_rate",
+    "credit_rating",
+    "collateral",
+    "application_date",
+    "reviewer"
+  ],
+  "field_labels": {
+    "company_name": "企业名称",
+    "industry": "行业领域",
+    "loan_type": "贷款类型",
+    "branch": "申请分行",
+    "loan_amount": "贷款金额",
+    "interest_rate": "利率方案",
+    "credit_rating": "信用评级",
+    "collateral": "抵押/担保物",
+    "application_date": "申请日期",
+    "reviewer": "审查人"
+  },
+  "field_weights": {
+    "company_name": 0.30,
+    "industry": 0.10,
+    "loan_type": 0.18,
+    "branch": 0.12,
+    "loan_amount": 0.26,
+    "interest_rate": 0.24,
+    "credit_rating": 0.22,
+    "collateral": 0.28,
+    "application_date": 0.06,
+    "reviewer": 0.08
+  },
+  "field_aliases": {
+    "loan_type": {
+      "流动资金贷款": [
+        "流动资金",
+        "流贷",
+        "周转贷款"
+      ],
+      "项目贷款": [
+        "项目融资",
+        "专项贷款",
+        "建设项目贷款"
+      ],
+      "固定资产贷款": [
+        "固贷",
+        "设备贷款",
+        "固定资产"
+      ],
+      "并购贷款": [
+        "并购融资",
+        "收购贷款",
+        "M&A贷款"
+      ],
+      "技术改造贷款": [
+        "技改贷款",
+        "改造升级贷款"
+      ]
+    },
+    "industry": {
+      "半导体制造": [
+        "半导体",
+        "芯片制造",
+        "集成电路"
+      ],
+      "新能源（光伏）": [
+        "光伏",
+        "太阳能",
+        "新能源"
+      ],
+      "医疗器械": [
+        "医疗设备",
+        "医疗器械制造"
+      ],
+      "数据中心/云计算": [
+        "数据中心",
+        "云计算",
+        "IDC"
+      ],
+      "房地产开发": [
+        "房地产",
+        "地产",
+        "住宅开发"
+      ],
+      "高端装备制造": [
+        "装备制造",
+        "精密机械",
+        "高端制造"
+      ]
+    },
+    "branch": {
+      "上海分行": [
+        "上海",
+        "沪"
+      ],
+      "杭州分行": [
+        "杭州",
+        "浙分"
+      ],
+      "深圳分行": [
+        "深圳",
+        "深分"
+      ],
+      "南京分行": [
+        "南京",
+        "宁分"
+      ]
+    },
+    "credit_rating": {
+      "AA+": [
+        "双A+",
+        "AA+级"
+      ],
+      "AA-": [
+        "双A-",
+        "AA-级"
+      ],
+      "A": [
+        "A级"
+      ],
+      "A+": [
+        "A+级"
+      ],
+      "BBB+": [
+        "三B+",
+        "BBB+级"
+      ],
+      "BB": [
+        "BB级",
+        "双B"
+      ]
+    },
+    "reviewer": {
+      "张经理": [
+        "张工",
+        "张审"
+      ],
+      "刘经理": [
+        "刘工",
+        "刘审"
+      ],
+      "陈经理": [
+        "陈工"
+      ],
+      "汪经理": [
+        "汪工"
+      ],
+      "赵经理": [
+        "赵工"
+      ]
+    }
+  },
+  "public_rules": [
+    {
+      "name": "房地产开发行业高风险，利率通常上浮150-250bp",
+      "field": "industry",
+      "values": ["房地产开发"],
+      "implies": {
+        "credit_rating": "BB"
+      }
+    },
+    {
+      "name": "LPR加点超200bp意味着BBB及以下评级",
+      "field": "interest_rate",
+      "values": ["年化5.65%"],
+      "implies": {
+        "credit_rating": "BB"
+      }
+    }
+  ],
+  "safe_replacements": {
+    "company_name": "某企业",
+    "industry": "相关行业",
+    "loan_type": "相关贷款类型",
+    "branch": "相关分行",
+    "loan_amount": "相关金额",
+    "interest_rate": "相关利率",
+    "credit_rating": "相关评级",
+    "collateral": "相关抵押物",
+    "application_date": "相关日期",
+    "reviewer": "相关审查人"
+  },
+  "safe_hint": "具体贷款金额、利率、信用评级和抵押担保信息应通过授权信贷管理系统查询。",
+  "match_type_weights": {
+    "exact": 1.00,
+    "alias": 0.90,
+    "semantic": 0.80,
+    "partial": 0.65,
+    "inferred": 0.70,
+    "ambiguous": 0.45
+  },
+  "llm_confidence_threshold": 0.40,
+  "llm_max_accepted_values": 30,
+  "llm_extraction_fields": ["loan_amount", "interest_rate", "credit_rating", "collateral"]
+}

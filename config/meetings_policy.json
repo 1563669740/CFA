@@ -1,0 +1,178 @@
+{
+  "uniqueness_k": 1,
+  "display_field": "meeting_topic",
+  "protected_fields": [
+    "restricted_content",
+    "confidential"
+  ],
+  "identifier_fields": [
+    "meeting_topic"
+  ],
+  "quasi_identifier_fields": [
+    "time_slot",
+    "room",
+    "participants",
+    "meeting_type",
+    "material_count"
+  ],
+  "field_order": [
+    "time_slot",
+    "room",
+    "participants",
+    "meeting_type",
+    "material_count",
+    "meeting_topic",
+    "restricted_content",
+    "confidential"
+  ],
+  "field_labels": {
+    "time_slot": "时间段",
+    "room": "会议室",
+    "participants": "参会方",
+    "meeting_type": "会议类型",
+    "material_count": "材料数量",
+    "meeting_topic": "会议主题",
+    "restricted_content": "受限内容",
+    "confidential": "涉密标识"
+  },
+  "field_weights": {
+    "time_slot": 0.18,
+    "room": 0.35,
+    "participants": 0.15,
+    "meeting_type": 0.22,
+    "material_count": 0.28,
+    "meeting_topic": 0.12,
+    "restricted_content": 0.10,
+    "confidential": 0.05
+  },
+  "field_aliases": {
+    "room": {
+      "B-307会议室": [
+        "B-307 会议室",
+        "B-307",
+        "B307",
+        "307会议室"
+      ],
+      "A-306会议室": [
+        "A-306 会议室",
+        "A-306",
+        "A306",
+        "306会议室"
+      ],
+      "C-201会议室": [
+        "C-201 会议室",
+        "C-201",
+        "C201",
+        "201会议室"
+      ],
+      "D-101会议室": [
+        "D-101 会议室",
+        "D-101",
+        "D101",
+        "101会议室"
+      ]
+    },
+    "meeting_type": {
+      "闭门评审": [
+        "闭门",
+        "不公开评审",
+        "非公开评审"
+      ],
+      "合同谈判": [
+        "谈判",
+        "商务谈判"
+      ],
+      "项目验收": [
+        "验收会",
+        "交付验收"
+      ],
+      "专项复查": [
+        "复查",
+        "绩效复查"
+      ],
+      "项目例会": [
+        "例会",
+        "进度会",
+        "周会"
+      ]
+    },
+    "participants": {
+      "外部供应商": [
+        "供应商",
+        "乙方",
+        "外部合作方"
+      ],
+      "内部员工": [
+        "内部",
+        "员工",
+        "同事"
+      ],
+      "合作方": [
+        "合作方",
+        "合作伙伴",
+        "战略合作方"
+      ]
+    },
+    "material_count": {
+      "6份材料": [
+        "6份",
+        "需要6份材料"
+      ],
+      "4份材料": [
+        "4份"
+      ],
+      "8份材料": [
+        "8份"
+      ]
+    },
+    "time_slot": {
+      "周四15:30": [
+        "周四下午",
+        "周四"
+      ],
+      "周四16:00": [
+        "周四下午"
+      ],
+      "周五10:00": [
+        "周五上午",
+        "周五"
+      ],
+      "周五14:00": [
+        "周五下午"
+      ],
+      "周三14:00": [
+        "周三下午"
+      ],
+      "周三10:00": [
+        "周三上午"
+      ]
+    }
+  },
+  "public_rules": [
+    {
+      "name": "闭门评审和合同谈判为涉密会议",
+      "field": "meeting_type",
+      "values": ["闭门评审", "合同谈判", "专项复查"],
+      "implies": {
+        "confidential": "true"
+      }
+    },
+    {
+      "name": "周四+B307+供应商+闭门评审+6份材料=涉密",
+      "field": "time_slot",
+      "values": ["周四15:30"],
+      "implies": {}
+    }
+  ],
+  "safe_replacements": {
+    "time_slot": "相关时段",
+    "room": "相关会议室",
+    "participants": "相关方",
+    "meeting_type": "相关会议",
+    "material_count": "若干材料",
+    "meeting_topic": "相关议题",
+    "restricted_content": "相关纪要",
+    "confidential": "敏感标识"
+  },
+  "safe_hint": "具体会议议题、参会方和涉密内容应通过授权OA系统查询。"
+}

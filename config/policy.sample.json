@@ -1,0 +1,98 @@
+﻿{
+  "uniqueness_k": 1,
+  "display_field": "system_name",
+  "protected_fields": [
+    "component_version",
+    "risk_status",
+    "disposition_status",
+    "remote_entry"
+  ],
+  "identifier_fields": [
+    "system_name"
+  ],
+  "quasi_identifier_fields": [
+    "business_domain",
+    "environment",
+    "function_category"
+  ],
+  "field_order": [
+    "business_domain",
+    "environment",
+    "function_category",
+    "system_name",
+    "component_version",
+    "risk_status",
+    "disposition_status",
+    "remote_entry"
+  ],
+  "field_labels": {
+    "system_name": "系统名称",
+    "business_domain": "业务域",
+    "environment": "部署环境",
+    "function_category": "系统类别/功能",
+    "component_version": "组件版本",
+    "risk_status": "风险状态",
+    "disposition_status": "处置状态",
+    "remote_entry": "远程入口"
+  },
+  "field_weights": {
+    "system_name": 0.35,
+    "business_domain": 0.08,
+    "environment": 0.08,
+    "function_category": 0.18,
+    "component_version": 0.28,
+    "risk_status": 0.22,
+    "disposition_status": 0.24,
+    "remote_entry": 0.16
+  },
+  "field_aliases": {
+    "disposition_status": {
+      "回滚未完成": [
+        "仍处于回滚窗口",
+        "回滚完成前"
+      ],
+      "已隔离": [
+        "已隔离的",
+        "隔离完成",
+        "已完成隔离"
+      ]
+    },
+    "risk_status": {
+      "高危": [
+        "高风险",
+        "高危风险"
+      ]
+    },
+    "remote_entry": {
+      "SSH 运维入口": [
+        "SSH 运维入口",
+        "SSH 运维入口访问",
+        "依赖 SSH 运维入口"
+      ]
+    }
+  },
+  "public_rules": [
+    {
+      "name": "CVE-2024-3094 affected XZ Utils versions",
+      "field": "component_version",
+      "values": [
+        "xz-utils 5.6.0",
+        "xz-utils 5.6.1"
+      ],
+      "implies": {
+        "risk_status": "高危"
+      }
+    }
+  ],
+  "safe_replacements": {
+    "system_name": "相关对象",
+    "business_domain": "相关业务域",
+    "environment": "相关环境",
+    "function_category": "相关系统",
+    "component_version": "受影响版本",
+    "risk_status": "相关风险状态",
+    "disposition_status": "相关处置状态",
+    "remote_entry": "远程入口"
+  },
+  "safe_hint": "具体资产名称、系统类型、组件版本和处置状态应通过授权资产管理系统查询。"
+}

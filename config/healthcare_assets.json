@@ -1,0 +1,98 @@
+[
+  {
+    "id": "P001",
+    "patient_name": "张伟",
+    "department": "心内科",
+    "ward_type": "普通病房",
+    "condition_summary": "胸痛待查",
+    "diagnosis": "冠心病（稳定型心绞痛）",
+    "medication": "阿司匹林 100mg qd + 阿托伐他汀 20mg qn",
+    "insurance_level": "城镇职工医保",
+    "admission_date": "2024-11-15",
+    "doctor": "李主任"
+  },
+  {
+    "id": "P002",
+    "patient_name": "张伟",
+    "department": "神经科",
+    "ward_type": "ICU",
+    "condition_summary": "脑卒中术后观察",
+    "diagnosis": "急性缺血性脑卒中（右侧大脑中动脉闭塞）",
+    "medication": "依达拉奉 30mg bid + 丁苯酞 25mg tid",
+    "insurance_level": "自费",
+    "admission_date": "2024-11-10",
+    "doctor": "王主任"
+  },
+  {
+    "id": "P003",
+    "patient_name": "李明",
+    "department": "心内科",
+    "ward_type": "普通病房",
+    "condition_summary": "心悸查因",
+    "diagnosis": "阵发性心房颤动（CHA₂DS₂-VASc 2分）",
+    "medication": "华法林 3mg qd（INR目标2.0-3.0）",
+    "insurance_level": "城镇居民医保",
+    "admission_date": "2024-11-18",
+    "doctor": "李主任"
+  },
+  {
+    "id": "P004",
+    "patient_name": "王芳",
+    "department": "心内科",
+    "ward_type": "ICU",
+    "condition_summary": "急性心梗介入术后",
+    "diagnosis": "急性广泛前壁心肌梗死（Killip II级）",
+    "medication": "替格瑞洛 90mg bid + 阿司匹林 100mg qd + 美托洛尔 25mg bid",
+    "insurance_level": "城镇职工医保",
+    "admission_date": "2024-11-20",
+    "doctor": "赵主任"
+  },
+  {
+    "id": "P005",
+    "patient_name": "王芳",
+    "department": "肿瘤科",
+    "ward_type": "特需病房",
+    "condition_summary": "化疗后观察",
+    "diagnosis": "右乳浸润性导管癌术后（pT2N1M0，IIB期）",
+    "medication": "曲妥珠单抗 6mg/kg q3w + 帕妥珠单抗 420mg q3w",
+    "insurance_level": "商业保险（高端医疗险）",
+    "admission_date": "2024-11-08",
+    "doctor": "陈主任"
+  },
+  {
+    "id": "P006",
+    "patient_name": "刘洋",
+    "department": "骨科",
+    "ward_type": "普通病房",
+    "condition_summary": "骨折术后康复",
+    "diagnosis": "左侧股骨转子间骨折（AO 31-A2型）",
+    "medication": "塞来昔布 200mg bid + 低分子肝素 4000IU qd",
+    "insurance_level": "城镇居民医保",
+    "admission_date": "2024-11-22",
+    "doctor": "孙主任"
+  },
+  {
+    "id": "P007",
+    "patient_name": "李明",
+    "department": "心内科",
+    "ward_type": "ICU",
+    "condition_summary": "心衰加重",
+    "diagnosis": "慢性心力衰竭急性失代偿（LVEF 32%，NT-proBNP 5800pg/mL）",
+    "medication": "呋塞米 40mg iv bid + 地高辛 0.125mg qd + 沙库巴曲缬沙坦 50mg bid",
+    "insurance_level": "城镇职工医保",
+    "admission_date": "2024-11-19",
+    "doctor": "赵主任"
+  },
+  {
+    "id": "P008",
+    "patient_name": "张伟",
+    "department": "肿瘤科",
+    "ward_type": "普通病房",
+    "condition_summary": "肿瘤复查",
+    "diagnosis": "左肺上叶腺癌术后（pT2aN0M0，IA2期，EGFR 19del）",
+    "medication": "奥希替尼 80mg qd",
+    "insurance_level": "大病医保",
+    "admission_date": "2024-11-12",
+    "doctor": "陈主任"
+  }
+]

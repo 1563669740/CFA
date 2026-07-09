@@ -1,0 +1,20 @@
+﻿[
+  {
+    "id": "FACT-001",
+    "name": "受限事实对象A",
+    "scene": "范围关键词A",
+    "scope": "业务范围A",
+    "public_trait": "公开线索A",
+    "restricted_fact": "受限事实值A",
+    "restricted_status": "受限状态A"
+  },
+  {
+    "id": "FACT-002",
+    "name": "受限事实对象B",
+    "scene": "范围关键词B",
+    "scope": "业务范围B",
+    "public_trait": "公开线索B",
+    "restricted_fact": "受限事实值B",
+    "restricted_status": "受限状态B"
+  }
+]

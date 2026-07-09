@@ -1,0 +1,45 @@
+{
+  "description": "公开医学知识规则，用于模拟 LLM 或公开资料可推断出的诊疗关系。",
+  "rules": [
+    {
+      "name": "奥希替尼仅用于EGFR突变阳性非小细胞肺癌",
+      "field": "medication",
+      "values": ["奥希替尼"],
+      "implies": {
+        "diagnosis": "肺腺癌（EGFR突变阳性）"
+      }
+    },
+    {
+      "name": "依达拉奉+丁苯酞是急性脑卒中标准治疗方案",
+      "field": "medication",
+      "values": ["依达拉奉", "丁苯酞"],
+      "implies": {
+        "diagnosis": "急性缺血性脑卒中"
+      }
+    },
+    {
+      "name": "曲妥珠单抗+帕妥珠单抗用于HER2阳性乳腺癌",
+      "field": "medication",
+      "values": ["曲妥珠单抗", "帕妥珠单抗"],
+      "implies": {
+        "diagnosis": "HER2阳性乳腺癌"
+      }
+    },
+    {
+      "name": "替格瑞洛+阿司匹林双抗是急性心梗PCI术后标准方案",
+      "field": "medication",
+      "values": ["替格瑞洛"],
+      "implies": {
+        "diagnosis": "急性心肌梗死（PCI术后）"
+      }
+    },
+    {
+      "name": "华法林用于房颤抗凝治疗",
+      "field": "medication",
+      "values": ["华法林"],
+      "implies": {
+        "diagnosis": "心房颤动（抗凝治疗）"
+      }
+    }
+  ]
+}

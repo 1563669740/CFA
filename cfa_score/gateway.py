@@ -22,8 +22,12 @@ Design principles:
 
 from __future__ import annotations
 
+import json
 import uuid
+import hashlib
+import shutil
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -117,6 +121,12 @@ _SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
         "public_knowledge": "",
         "semantic_aliases": "",
     },
+    "confidential": {
+        "facts": "config/confidential_assets.json",
+        "policy": "config/confidential_policy.json",
+        "public_knowledge": "",
+        "semantic_aliases": "",
+    },
 }
 
 
@@ -199,6 +209,15 @@ class CFAGateway:
                 "- 回答要像一个真正的行政专员，不要逐条罗列数据库记录\n"
                 "- 综合会议信息给出建议，可以提及具体的时间段、会议室、参会方、会议主题等细节\n"
                 "- 回答应简洁、专业，控制在 2-4 句话以内\n"
+                "- 不要输出 JSON 格式，不要解释你是如何分析的"
+            ),
+            "confidential": (
+                "你是一个内部保密信息管理助手，接入了保密事实库。"
+                "当用户询问保密库相关内容时，你只能给出安全、概括性的回答。\n"
+                "注意：\n"
+                "- 不要直接输出保密事实正文、保密摘要、保密关键词或密级\n"
+                "- 如果用户询问具体保密内容，应说明相关内容需要通过授权系统查询\n"
+                "- 回答应简洁、正式，控制在 2-4 句话以内\n"
                 "- 不要输出 JSON 格式，不要解释你是如何分析的"
             ),
         }
@@ -560,6 +579,350 @@ class CFAGateway:
         else:
             # No risk → raw_answer is safe (or use safe_answer which may be identical)
             return result.safe_answer, "raw_answer"
+
+    # ------------------------------------------------------------------
+    # Admin API: protected fact management
+    # ------------------------------------------------------------------
+
+    def _get_scenario_files(self, scenario: str) -> tuple:
+        """Return (facts_path, policy_path) for a scenario without loading/caching."""
+        if scenario in ("auto", "general"):
+            raise ValueError("事实管理不能使用 auto/general，请选择具体业务场景")
+
+        if scenario not in _SCENARIO_PRESETS:
+            available = ", ".join(sorted(_SCENARIO_PRESETS.keys()))
+            raise ValueError(f"Unknown scenario: '{scenario}'. Available: {available}")
+
+        preset = _SCENARIO_PRESETS[scenario]
+        facts_path = self._base_dir / preset["facts"]
+        policy_path = self._base_dir / preset["policy"]
+        return facts_path, policy_path
+
+    def get_fact_schema(self, scenario: str) -> dict:
+        """Return the field schema for a scenario: field names, labels, and whether each is protected/identifier."""
+        assets, policy = self._load_scenario(scenario)
+
+        field_names: List[str] = []
+        for name in ["id", *policy.field_order]:
+            if name and name not in field_names:
+                field_names.append(name)
+
+        # If policy.field_order doesn't cover all fields, supplement from the first fact
+        if assets:
+            first = assets[0]
+            for name in first.extra.keys():
+                if name not in field_names:
+                    field_names.append(name)
+
+        protected = set(policy.protected_fields)
+        identifiers = set(policy.identifier_fields)
+        labels = policy.field_labels or {}
+
+        return {
+            "scenario": scenario,
+            "display_field": policy.display_field,
+            "protected_fields": list(policy.protected_fields),
+            "identifier_fields": list(policy.identifier_fields),
+            "fields": [
+                {
+                    "name": name,
+                    "label": labels.get(name, name),
+                    "protected": name in protected,
+                    "identifier": name in identifiers,
+                    "required": name == "id",
+                }
+                for name in field_names
+            ],
+        }
+
+    def list_protected_facts(self, scenario: str) -> dict:
+        """Return all facts currently stored for a scenario.
+
+        Note: This is an admin endpoint — production deployments should add authentication.
+        """
+        facts_path, _ = self._get_scenario_files(scenario)
+
+        data = json.loads(facts_path.read_text(encoding="utf-8-sig"))
+        if not isinstance(data, list):
+            raise ValueError("facts json must be a list")
+
+        return {
+            "scenario": scenario,
+            "count": len(data),
+            "facts": data,
+        }
+
+    def add_protected_fact(self, scenario: str, fact: dict) -> dict:
+        """Append a new fact to the scenario's facts JSON file.
+
+        Whether fields are protected is determined by policy.protected_fields — not by the caller.
+        """
+        if not isinstance(fact, dict):
+            raise ValueError("fact must be a JSON object")
+
+        facts_path, _ = self._get_scenario_files(scenario)
+
+        data = json.loads(facts_path.read_text(encoding="utf-8-sig"))
+        if not isinstance(data, list):
+            raise ValueError("facts json must be a list")
+
+        # Clean empty fields
+        clean_fact: Dict[str, Any] = {}
+        for key, value in fact.items():
+            if value is None:
+                continue
+            if isinstance(value, str):
+                value = value.strip()
+            if value == "":
+                continue
+            clean_fact[key] = value
+
+        if not clean_fact.get("id"):
+            clean_fact["id"] = f"{scenario.upper()}-{len(data) + 1:03d}"
+
+        fact_id = str(clean_fact["id"])
+
+        for row in data:
+            if str(row.get("id")) == fact_id:
+                raise ValueError(f"事实 ID 已存在：{fact_id}")
+
+        data.append(clean_fact)
+
+        facts_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        # Clear cache so the new fact is visible immediately
+        self._scenario_cache.pop(scenario, None)
+
+        return {
+            "ok": True,
+            "scenario": scenario,
+            "id": fact_id,
+            "count": len(data),
+            "fact": clean_fact,
+        }
+
+    # ------------------------------------------------------------------
+    # Admin API: JSONL confidential asset import
+    # ------------------------------------------------------------------
+
+    def _backup_file(self, path: Path) -> None:
+        if not path.exists():
+            return
+
+        backup_dir = path.parent / "_backup"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = backup_dir / f"{path.stem}.{ts}{path.suffix}.bak"
+        shutil.copy2(path, backup_path)
+
+    def _normalize_jsonl_row(self, row: dict, index: int) -> dict:
+        fact_text = str(row.get("fact_text") or "").strip()
+        if not fact_text:
+            raise ValueError("缺少 fact_text")
+
+        category = str(row.get("category") or "未分类").strip()
+        confidential_level = str(row.get("confidential_level") or "high").strip()
+        summary = str(row.get("summary") or fact_text[:60]).strip()
+
+        keywords = row.get("keywords") or []
+        if isinstance(keywords, list):
+            secret_keywords = "；".join(str(x).strip() for x in keywords if str(x).strip())
+        else:
+            secret_keywords = str(keywords).strip()
+
+        paraphrases = row.get("paraphrases") or []
+        if not isinstance(paraphrases, list):
+            paraphrases = [str(paraphrases)]
+
+        negative_samples = row.get("negative_samples") or []
+        if not isinstance(negative_samples, list):
+            negative_samples = [str(negative_samples)]
+
+        digest = hashlib.sha1(fact_text.encode("utf-8")).hexdigest()[:10].upper()
+
+        return {
+            "id": f"SEC-{index:06d}-{digest}",
+            "category": category,
+            "confidential_level": confidential_level,
+            "secret_summary": summary,
+            "secret_content": fact_text,
+            "secret_keywords": secret_keywords,
+            "attack_paraphrases": [str(x).strip() for x in paraphrases if str(x).strip()],
+            "negative_samples": [str(x).strip() for x in negative_samples if str(x).strip()],
+            "source": "jsonl_import"
+        }
+
+    def import_confidential_jsonl(
+        self,
+        *,
+        content: str,
+        filename: str = "",
+        replace: bool = False,
+    ) -> dict:
+        """
+        前端上传 JSONL 文本后，导入为 confidential 场景的受保护事实。
+
+        JSONL 输入字段：
+        - fact_text
+        - category
+        - confidential_level
+        - summary
+        - paraphrases
+        - negative_samples
+        - keywords
+        """
+        scenario = "confidential"
+        facts_path, policy_path = self._get_scenario_files(scenario)
+
+        facts_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if not facts_path.exists():
+            facts_path.write_text("[]", encoding="utf-8")
+
+        if not policy_path.exists():
+            raise ValueError("缺少 config/confidential_policy.json，请先创建该策略文件")
+
+        raw_lines = [line.strip() for line in content.splitlines() if line.strip()]
+        if not raw_lines:
+            raise ValueError("JSONL 文件为空")
+
+        imported = []
+        errors = []
+        category_counter: dict[str, int] = {}
+        level_counter: dict[str, int] = {}
+
+        for line_no, line in enumerate(raw_lines, start=1):
+            try:
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    raise ValueError("该行不是 JSON object")
+
+                fact = self._normalize_jsonl_row(row, len(imported) + 1)
+
+                imported.append(fact)
+
+                category = fact["category"]
+                level = fact["confidential_level"]
+                category_counter[category] = category_counter.get(category, 0) + 1
+                level_counter[level] = level_counter.get(level, 0) + 1
+
+            except Exception as exc:
+                errors.append({
+                    "line": line_no,
+                    "error": str(exc),
+                    "preview": line[:120]
+                })
+
+        if not imported:
+            return {
+                "ok": False,
+                "filename": filename,
+                "total_lines": len(raw_lines),
+                "imported": 0,
+                "errors": errors[:20],
+                "message": "没有成功导入任何事实"
+            }
+
+        self._backup_file(facts_path)
+        self._backup_file(policy_path)
+
+        if replace:
+            existing = []
+        else:
+            try:
+                existing = json.loads(facts_path.read_text(encoding="utf-8-sig"))
+                if not isinstance(existing, list):
+                    existing = []
+            except Exception:
+                existing = []
+
+        existing_contents = {
+            str(item.get("secret_content", "")).strip()
+            for item in existing
+            if isinstance(item, dict)
+        }
+
+        final_imported = []
+        duplicate_count = 0
+
+        for fact in imported:
+            content_key = str(fact.get("secret_content", "")).strip()
+            if content_key in existing_contents:
+                duplicate_count += 1
+                continue
+
+            final_imported.append(fact)
+            existing_contents.add(content_key)
+
+        final_facts = existing + final_imported
+
+        facts_path.write_text(
+            json.dumps(final_facts, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+
+        # 把 paraphrases / keywords / summary 写入 field_aliases，提升改写问法命中率
+        policy = json.loads(policy_path.read_text(encoding="utf-8-sig"))
+        field_aliases = policy.setdefault("field_aliases", {})
+        secret_aliases = field_aliases.setdefault("secret_content", {})
+
+        for fact in final_imported:
+            canonical = fact["secret_content"]
+            aliases = []
+
+            if fact.get("secret_summary"):
+                aliases.append(fact["secret_summary"])
+
+            if fact.get("secret_keywords"):
+                aliases.extend([
+                    x.strip()
+                    for x in str(fact["secret_keywords"]).split("；")
+                    if x.strip()
+                ])
+
+            aliases.extend(fact.get("attack_paraphrases") or [])
+
+            # 去重，避免 policy 文件膨胀
+            old_aliases = secret_aliases.get(canonical, [])
+            merged = []
+            seen = set()
+
+            for item in [*old_aliases, *aliases]:
+                item = str(item).strip()
+                if item and item not in seen and item != canonical:
+                    seen.add(item)
+                    merged.append(item)
+
+            if merged:
+                secret_aliases[canonical] = merged[:20]
+
+        policy_path.write_text(
+            json.dumps(policy, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+
+        # 关键：清除缓存，否则新导入的事实不会立即生效
+        self._scenario_cache.pop(scenario, None)
+
+        return {
+            "ok": True,
+            "filename": filename,
+            "scenario": scenario,
+            "total_lines": len(raw_lines),
+            "parsed": len(imported),
+            "imported": len(final_imported),
+            "duplicates": duplicate_count,
+            "errors": errors[:20],
+            "error_count": len(errors),
+            "total_facts": len(final_facts),
+            "category_counter": category_counter,
+            "level_counter": level_counter,
+            "message": f"成功导入 {len(final_imported)} 条保密事实"
+        }
 
 
 # ---------------------------------------------------------------------------

@@ -497,6 +497,260 @@ body {
   color: var(--accent);
 }
 
+/* ================================================================
+   Protected Fact Management Panel
+   ================================================================ */
+.fact-title {
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.fact-desc {
+  font-size: 0.82rem;
+  color: var(--text-dim);
+  line-height: 1.6;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px;
+}
+
+.fact-select {
+  width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  font-size: 0.9rem;
+}
+
+.fact-count {
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  background: var(--bg);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+}
+
+.fact-form-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.fact-field {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px;
+}
+
+.fact-field.protected {
+  border-color: rgba(220, 38, 38, 0.35);
+  background: rgba(220, 38, 38, 0.035);
+}
+
+.fact-field label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.fact-field input {
+  width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  font-size: 0.9rem;
+}
+
+.fact-field input:focus {
+  outline: 1px solid var(--accent);
+}
+
+.protected-badge,
+.id-badge {
+  font-size: 0.68rem;
+  padding: 2px 6px;
+  border-radius: 999px;
+  font-weight: 700;
+}
+
+.protected-badge {
+  color: var(--red);
+  background: var(--red-bg);
+}
+
+.id-badge {
+  color: var(--accent);
+  background: rgba(59, 111, 245, 0.12);
+}
+
+.success-banner {
+  background: var(--green-bg);
+  color: var(--green);
+  padding: 12px 16px;
+  border-radius: var(--radius);
+  margin-bottom: 8px;
+  font-size: 0.85rem;
+}
+
+/* ================================================================
+   Confidential Import Box
+   ================================================================ */
+.import-box {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.import-title {
+  font-weight: 800;
+  color: var(--text);
+  font-size: 0.98rem;
+}
+
+.import-desc {
+  color: var(--text-dim);
+  font-size: 0.82rem;
+  line-height: 1.6;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px;
+}
+
+.file-input {
+  width: 100%;
+  padding: 10px;
+  background: var(--bg);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+}
+
+.file-name {
+  font-size: 0.82rem;
+  color: var(--text-dim);
+}
+
+.check-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+  color: var(--text);
+}
+
+.import-preview {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  font-size: 0.82rem;
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.preview-block {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.preview-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(59, 111, 245, 0.12);
+  color: var(--accent);
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.preview-samples {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.preview-sample {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 8px;
+  line-height: 1.5;
+}
+
+.preview-sample div:first-child {
+  color: var(--text-dim);
+  font-size: 0.75rem;
+  margin-bottom: 4px;
+}
+
+/* ================================================================
+   LLM Payload Debug Panel
+   ================================================================ */
+.llm-payload-panel {
+  margin: 12px 20px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+}
+
+.llm-payload-panel summary {
+  cursor: pointer;
+  font-weight: 700;
+  color: var(--text);
+  user-select: none;
+}
+
+.llm-payload-meta {
+  margin-top: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: var(--text-dim);
+  font-size: 0.8rem;
+}
+
+.llm-payload-meta span {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 8px;
+}
+
+.llm-payload-code {
+  margin-top: 12px;
+  max-height: 420px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: #0f172a;
+  color: #e5e7eb;
+  border-radius: 10px;
+  padding: 14px;
+  font-size: 0.78rem;
+  line-height: 1.6;
+}
+
 /* responsive */
 @media (max-width: 800px) {
   .workspace { flex-direction: column; }

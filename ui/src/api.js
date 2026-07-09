@@ -40,3 +40,78 @@ export async function cfaAnalyze({ user_input, model_output, scenario, mode, sec
   }
   return res.json();
 }
+
+/** GET /api/fact-schema?scenario=xxx */
+export async function fetchFactSchema(scenario) {
+  const res = await fetch(`${BASE}/fact-schema?scenario=${encodeURIComponent(scenario || 'healthcare')}`);
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `HTTP ${res.status}`);
+  }
+
+  return res.json();
+}
+
+/** GET /api/protected-facts?scenario=xxx */
+export async function fetchProtectedFacts(scenario) {
+  const res = await fetch(`${BASE}/protected-facts?scenario=${encodeURIComponent(scenario || 'healthcare')}`);
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `HTTP ${res.status}`);
+  }
+
+  return res.json();
+}
+
+/** POST /api/protected-facts */
+export async function addProtectedFact({ scenario, fact }) {
+  const res = await fetch(`${BASE}/protected-facts`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      scenario: scenario || 'healthcare',
+      fact,
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `HTTP ${res.status}`);
+  }
+
+  return res.json();
+}
+
+/** GET /api/debug/last-llm-payload */
+export async function fetchLastLlmPayload() {
+  const res = await fetch(`${BASE}/debug/last-llm-payload`);
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `HTTP ${res.status}`);
+  }
+
+  return res.json();
+}
+
+/** POST /api/protected-facts/import-jsonl */
+export async function importConfidentialJsonl({ content, filename, replace }) {
+  const res = await fetch(`${BASE}/protected-facts/import-jsonl`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      content,
+      filename,
+      replace: Boolean(replace),
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `HTTP ${res.status}`);
+  }
+
+  return res.json();
+}

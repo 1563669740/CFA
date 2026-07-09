@@ -31,7 +31,7 @@ import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any, Dict, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 from .gateway import CFAGateway
 
@@ -71,6 +71,12 @@ class _CFAHandler(BaseHTTPRequestHandler):
             self._health()
         elif path == "/api/scenarios":
             self._list_scenarios()
+        elif path == "/api/fact-schema":
+            self._fact_schema(parsed)
+        elif path == "/api/protected-facts":
+            self._list_protected_facts(parsed)
+        elif path == "/api/debug/last-llm-payload":
+            self._debug_last_llm_payload()
         else:
             self._not_found()
 
@@ -82,6 +88,10 @@ class _CFAHandler(BaseHTTPRequestHandler):
             self._cfa_chat()
         elif path == "/api/cfa-analyze":
             self._cfa_analyze()
+        elif path == "/api/protected-facts":
+            self._add_protected_fact()
+        elif path == "/api/protected-facts/import-jsonl":
+            self._import_confidential_jsonl()
         else:
             self._not_found()
 
@@ -160,6 +170,107 @@ class _CFAHandler(BaseHTTPRequestHandler):
             self._respond(400, {"error": str(exc)})
         except Exception as exc:
             self._respond(500, {"error": f"CFA analyze error: {exc}"})
+
+    # ------------------------------------------------------------------
+    # Admin: fact management endpoints
+    # ------------------------------------------------------------------
+
+    def _get_query_scenario(self, parsed, default: str = "healthcare") -> str:
+        query = parse_qs(parsed.query)
+        return query.get("scenario", [default])[0]
+
+    def _fact_schema(self, parsed) -> None:
+        scenario = self._get_query_scenario(parsed)
+
+        try:
+            data = self.gateway.get_fact_schema(scenario)
+            self._respond(200, data)
+        except ValueError as exc:
+            self._respond(400, {"error": str(exc)})
+        except Exception as exc:
+            self._respond(500, {"error": f"fact schema error: {exc}"})
+
+    def _list_protected_facts(self, parsed) -> None:
+        scenario = self._get_query_scenario(parsed)
+
+        try:
+            data = self.gateway.list_protected_facts(scenario)
+            self._respond(200, data)
+        except ValueError as exc:
+            self._respond(400, {"error": str(exc)})
+        except Exception as exc:
+            self._respond(500, {"error": f"list facts error: {exc}"})
+
+    def _add_protected_fact(self) -> None:
+        body = self._read_json()
+        if body is None:
+            return
+
+        scenario = body.get("scenario", "healthcare")
+        fact = body.get("fact")
+
+        if not isinstance(fact, dict):
+            self._respond(400, {"error": "Missing required field: fact object"})
+            return
+
+        try:
+            data = self.gateway.add_protected_fact(scenario, fact)
+            self._respond(200, data)
+        except ValueError as exc:
+            self._respond(400, {"error": str(exc)})
+        except Exception as exc:
+            self._respond(500, {"error": f"add fact error: {exc}"})
+
+    def _import_confidential_jsonl(self) -> None:
+        body = self._read_json()
+        if body is None:
+            return
+
+        content = body.get("content", "")
+        filename = body.get("filename", "")
+        replace = bool(body.get("replace", False))
+
+        if not isinstance(content, str) or not content.strip():
+            self._respond(400, {"error": "Missing required field: content"})
+            return
+
+        try:
+            data = self.gateway.import_confidential_jsonl(
+                content=content,
+                filename=filename,
+                replace=replace,
+            )
+            self._respond(200, data)
+        except ValueError as exc:
+            self._respond(400, {"error": str(exc)})
+        except Exception as exc:
+            self._respond(500, {"error": f"import jsonl error: {exc}"})
+
+    # ------------------------------------------------------------------
+    # Debug endpoints
+    # ------------------------------------------------------------------
+
+    def _debug_last_llm_payload(self) -> None:
+        """
+        调试接口：返回最近一次真实发给 LLM 的 payload。
+        仅用于本地开发/汇报演示，生产环境必须关闭或加管理员鉴权。
+        """
+        root = Path(__file__).resolve().parent.parent
+        path = root / "logs" / "last_llm_payload.json"
+
+        if not path.exists():
+            self._respond(404, {
+                "error": "还没有捕获到 LLM 请求。请先在对话模式发送一次请求。"
+            })
+            return
+
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+            self._respond(200, data)
+        except Exception as exc:
+            self._respond(500, {
+                "error": f"读取 LLM payload 失败: {exc}"
+            })
 
     # ------------------------------------------------------------------
     # Helpers

@@ -26,6 +26,9 @@ Thumbs.db
 # Project outputs
 report.json
 
+# Debug / runtime logs
+logs/
+
 # Binary / document files
 *.docx
 *.pptx

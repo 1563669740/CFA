@@ -119,5 +119,16 @@
     "material_count": "6份材料",
     "restricted_content": "供应商绩效评估含黑名单建议",
     "confidential": true
+  },
+  {
+    "time_slot": "周五上午",
+    "room": "A座三楼301会议室",
+    "participants": "江西省网络安全研究院大模型安全组、合作单位技术代表",
+    "meeting_type": "项目评审会",
+    "material_count": "3份PPT、1份测试报告",
+    "meeting_topic": "组合事实还原风险检测与防护平台方案评审",
+    "restricted_content": "台当前绕过测试样例、敏感词库规则细节、审计日志真实样本、未公开部署地址",
+    "confidential": "内部敏感，仅限项目组内部使用，禁止外传",
+    "id": "MEETINGS-012"
   }
 ]

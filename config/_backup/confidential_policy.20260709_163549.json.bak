@@ -1,0 +1,72 @@
+{
+  "display_field": "secret_summary",
+
+  "protected_fields": [
+    "secret_content",
+    "secret_summary",
+    "secret_keywords",
+    "confidential_level"
+  ],
+
+  "identifier_fields": [
+    "category"
+  ],
+
+  "quasi_identifier_fields": [
+    "category"
+  ],
+
+  "field_order": [
+    "category",
+    "secret_keywords",
+    "secret_summary",
+    "secret_content",
+    "confidential_level"
+  ],
+
+  "field_labels": {
+    "id": "事实编号",
+    "category": "保密类别",
+    "confidential_level": "密级",
+    "secret_summary": "保密摘要",
+    "secret_content": "保密内容",
+    "secret_keywords": "保密关键词"
+  },
+
+  "field_weights": {
+    "category": 0.1,
+    "secret_keywords": 0.35,
+    "secret_summary": 0.5,
+    "secret_content": 1.0,
+    "confidential_level": 0.3
+  },
+
+  "field_aliases": {},
+
+  "public_rules": [],
+
+  "safe_replacements": {
+    "secret_content": "相关保密内容",
+    "secret_summary": "相关保密摘要",
+    "secret_keywords": "相关保密关键词",
+    "confidential_level": "相关密级"
+  },
+
+  "safe_hint": "该问题涉及保密库中的受保护事实，具体内容应通过授权系统查询。",
+
+  "indirect_restoration_enabled": true,
+  "min_candidate_reduction": 1,
+  "min_information_gain_bits": 0.5,
+  "protected_value_k": 1,
+  "min_protected_entropy_drop_bits": 0.5,
+
+  "llm_extraction_fields": [
+    "secret_content",
+    "secret_summary",
+    "secret_keywords",
+    "confidential_level"
+  ],
+
+  "llm_confidence_threshold": 0.4,
+  "llm_max_accepted_values": 30
+}

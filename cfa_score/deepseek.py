@@ -5,6 +5,7 @@ import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Sequence, Mapping
 
@@ -50,6 +51,30 @@ class DeepSeekClient:
     def __init__(self, config: DeepSeekConfig):
         self.config = config
 
+    def _debug_payload_path(self) -> Path:
+        root = Path(__file__).resolve().parent.parent
+        debug_dir = root / "logs"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        return debug_dir / "last_llm_payload.json"
+
+    def _write_debug_payload(self, payload: dict) -> None:
+        """
+        保存最近一次真实发给 LLM 的请求体。
+        注意：这里不保存 Authorization 请求头，所以不会暴露 API Key。
+        """
+        debug_payload = {
+            "captured_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "base_url": self.config.base_url,
+            "model": self.config.model,
+            "payload": payload,
+        }
+
+        path = self._debug_payload_path()
+        path.write_text(
+            json.dumps(debug_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
     def chat(
         self,
         messages: Sequence[Mapping[str, str]],
@@ -62,6 +87,9 @@ class DeepSeekClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+
+        self._write_debug_payload(payload)
+
         request = urllib.request.Request(
             url=f"{self.config.base_url.rstrip('/')}/chat/completions",
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),

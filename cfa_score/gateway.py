@@ -25,7 +25,9 @@ from __future__ import annotations
 import json
 import uuid
 import hashlib
+import re
 import shutil
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -49,7 +51,7 @@ from .intent_router import (
     AMBIGUOUS,
 )
 from .knowledge import load_assets, load_policy, load_public_knowledge, load_semantic_aliases, merge_public_knowledge
-from .models import AnalysisResult, FieldPolicy, AssetFact
+from .models import AnalysisResult, FieldPolicy, AssetFact, RiskFinding
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +60,7 @@ from .models import AnalysisResult, FieldPolicy, AssetFact
 
 @dataclass
 class GatewayResponse:
-    """Public-facing response.  Includes risk detail and routing info for UI transparency."""
+    """Public-facing response with confidential-safe serialization guard."""
     request_id: str
     answer: str
     raw_answer: str           # LLM 原始输出（对话模式）或 model_output（分析模式）
@@ -73,9 +75,15 @@ class GatewayResponse:
     routed_scenario: str = ""   # the scenario that actually handled the request
     answer_strategy: str = ""   # "cfa_gated" | "general_answer" | "weather_answer" | "need_city_prompt"
     llm_debug_refs: List[Dict[str, Any]] = field(default_factory=list)
+    sensitive_response: bool = False
 
     def to_dict(self, debug: bool = False) -> Dict[str, Any]:
-        """Serialize to dict.  ``debug=True`` includes raw_answer and findings_summary."""
+        """Serialize to dict.
+
+        ``debug=True`` may include raw/finding details for ordinary scenarios.
+        Confidential responses ignore debug details so restored fact IDs and
+        reduction evidence never leave the backend.
+        """
         data: Dict[str, Any] = {
             "request_id": self.request_id,
             "answer": self.answer,
@@ -89,7 +97,7 @@ class GatewayResponse:
             "answer_strategy": self.answer_strategy,
             "llm_debug_refs": self.llm_debug_refs,
         }
-        if debug:
+        if debug and not self.sensitive_response:
             data["raw_answer"] = self.raw_answer
             data["findings_summary"] = self.findings_summary
         return data
@@ -315,6 +323,17 @@ class CFAGateway:
 
         # ---- Step 4: Select final safe answer ----
         final_answer, safe_used = self._select_final_answer(result)
+        if effective_scenario == "confidential":
+            final_answer, safe_used = self._apply_confidential_local_gate(
+                request_id=request_id,
+                user_input=user_input,
+                model_output=raw_answer,
+                result=result,
+                assets=assets,
+                policy=policy,
+                final_answer=final_answer,
+                safe_used=safe_used,
+            )
 
         # ---- Step 5: Build public response ----
         return _build_response(
@@ -323,6 +342,7 @@ class CFAGateway:
             routed_scenario=effective_scenario,
             answer_strategy="cfa_gated",
             llm_debug_refs=llm_debug_refs,
+            sensitive_response=(effective_scenario == "confidential"),
         )
 
     def handle_analyze(
@@ -363,9 +383,28 @@ class CFAGateway:
 
         # 3. Select final safe answer
         final_answer, safe_used = self._select_final_answer(result)
+        if scenario == "confidential":
+            final_answer, safe_used = self._apply_confidential_local_gate(
+                request_id=request_id,
+                user_input=user_input,
+                model_output=model_output,
+                result=result,
+                assets=assets,
+                policy=policy,
+                final_answer=final_answer,
+                safe_used=safe_used,
+            )
 
         # 4. Build public response
-        return _build_response(request_id, result, final_answer, safe_used)
+        return _build_response(
+            request_id,
+            result,
+            final_answer,
+            safe_used,
+            routed_scenario=scenario,
+            answer_strategy="cfa_gated",
+            sensitive_response=(scenario == "confidential"),
+        )
 
     # ------------------------------------------------------------------
     # Internal: scenario loading (cached)
@@ -614,7 +653,10 @@ class CFAGateway:
             return fallback, []
 
         if not self._is_confidential_text_safe(answer, assets, policy):
-            return fallback, [debug_ref]
+            # Keep the raw LLM output internal so the post-CFA local gate can
+            # record the direct-leak trigger in backend audit.  The confidential
+            # response serializer never exposes it to callers.
+            return answer, [debug_ref]
         return answer, [debug_ref]
 
     def _build_confidential_llm_query(self, safe_knowledge: Mapping[str, Any]) -> str:
@@ -709,17 +751,47 @@ class CFAGateway:
         assets: List[AssetFact],
         policy: FieldPolicy,
     ) -> None:
+        hits = self._detect_confidential_direct_leak(text, assets, policy)
+        if hits:
+            raise RuntimeError(f"Blocked confidential text leakage: {hits[:10]}")
+
+    def _detect_confidential_direct_leak(
+        self,
+        text: str,
+        assets: List[AssetFact],
+        policy: FieldPolicy,
+    ) -> List[str]:
+        """Return confidential markers/values directly present in text.
+
+        Matching is deterministic and local only.  It normalizes common spacing
+        and width variants so values such as ``12.5 亿元`` and ``12.5亿元`` are
+        treated as the same sensitive value.
+        """
+        raw_text = str(text or "")
+        normalized_text = _normalize_confidential_match_text(raw_text)
         forbidden_markers = [
             "SEC-", "保密内容=", "保密关键词=", "保密类别=", "保密摘要=",
             "保密事实库", "密级=", "机密★", "绝密★", "秘密★",
             "【内部资产台账】",
         ]
-        hits = [marker for marker in forbidden_markers if marker in text]
+        hits: List[str] = []
+        seen = set()
+
+        for marker in forbidden_markers:
+            if marker in raw_text or _normalize_confidential_match_text(marker) in normalized_text:
+                if marker not in seen:
+                    hits.append(marker)
+                    seen.add(marker)
+
         for value in self._iter_confidential_sensitive_values(assets, policy):
-            if value and value in text:
-                hits.append(value)
-        if hits:
-            raise RuntimeError(f"Blocked confidential text leakage: {hits[:10]}")
+            if not value:
+                continue
+            normalized_value = _normalize_confidential_match_text(value)
+            if value in raw_text or (normalized_value and normalized_value in normalized_text):
+                if value not in seen:
+                    hits.append(value)
+                    seen.add(value)
+        return hits
 
     def _iter_confidential_sensitive_values(
         self,
@@ -735,6 +807,9 @@ class CFAGateway:
             "confidential_level",
             "attack_paraphrases",
         ]
+        for field_name in list(policy.protected_fields or []) + list(policy.sensitive_fields or []):
+            if field_name not in fields:
+                fields.append(field_name)
         for asset in assets:
             for field_name in fields:
                 raw_value = asset.id if field_name == "id" else asset.extra.get(field_name, asset.get(field_name))
@@ -835,6 +910,7 @@ class CFAGateway:
                 "inject_fact_pool": False,
                 "safe_knowledge_type": "",
             }],
+            sensitive_response=False,
         )
 
     # ------------------------------------------------------------------
@@ -857,6 +933,254 @@ class CFAGateway:
         else:
             # No risk → raw_answer is safe (or use safe_answer which may be identical)
             return result.safe_answer, "raw_answer"
+
+    def _apply_confidential_local_gate(
+        self,
+        *,
+        request_id: str,
+        user_input: str,
+        model_output: str,
+        result: AnalysisResult,
+        assets: List[AssetFact],
+        policy: FieldPolicy,
+        final_answer: str,
+        safe_used: str,
+    ) -> tuple[str, str]:
+        """Final local gate for confidential answers before any public response."""
+        direct_hits = self._detect_confidential_direct_leak(model_output, assets, policy)
+        synthetic_findings = self._build_direct_leak_findings(
+            direct_hits,
+            result,
+            assets,
+            policy,
+        )
+        if synthetic_findings:
+            result.findings.extend(synthetic_findings)
+
+        triggered_findings = [
+            finding for finding in result.findings
+            if finding.finding_type in {
+                "direct_protected_disclosure",
+                "indirect_asset_restoration",
+                "indirect_protected_value_restoration",
+            }
+            or (
+                finding.final_candidate_count == 1
+                and finding.input_candidate_count != 1
+            )
+        ]
+        risk_detected = bool(direct_hits or triggered_findings or result.findings)
+
+        selected_answer = final_answer
+        selected_safe_used = safe_used
+        if risk_detected:
+            selected_answer = self._confidential_safe_template_for_input(user_input, assets, policy)
+            selected_safe_used = "cfa_safe_answer"
+
+        self._write_confidential_audit_event(
+            request_id=request_id,
+            user_input=user_input,
+            model_output=model_output,
+            result=result,
+            direct_hits=direct_hits,
+            safe_answer_used=selected_safe_used,
+        )
+        return selected_answer, selected_safe_used
+
+    def _confidential_safe_template_for_input(
+        self,
+        user_input: str,
+        assets: List[AssetFact],
+        policy: FieldPolicy,
+    ) -> str:
+        service = ConfidentialLocalService(assets=assets, policy=policy)
+        decision = service.classify_and_match(user_input)
+        sub_scene = decision.get("sub_scene", "confidential_general") if decision.get("matched") else "confidential_general"
+        return ConfidentialLocalService.get_safe_template(str(sub_scene))
+
+    def _build_direct_leak_findings(
+        self,
+        direct_hits: List[str],
+        result: AnalysisResult,
+        assets: List[AssetFact],
+        policy: FieldPolicy,
+    ) -> List[RiskFinding]:
+        """Create internal findings when normalized direct matching catches a leak."""
+        if not direct_hits:
+            return []
+        existing_ids = {
+            finding.target_asset_id
+            for finding in result.findings
+            if finding.finding_type == "direct_protected_disclosure"
+        }
+        raw_output = result.raw_answer or result.model_output
+        output_norm = _normalize_confidential_match_text(raw_output)
+        generic_marker_norms = {
+            _normalize_confidential_match_text(marker)
+            for marker in [
+                "SEC-", "保密内容=", "保密关键词=", "保密类别=", "保密摘要=",
+                "保密事实库", "密级=", "机密★", "绝密★", "秘密★",
+                "【内部资产台账】",
+            ]
+        }
+        hit_norms = [
+            _normalize_confidential_match_text(hit)
+            for hit in direct_hits
+            if _normalize_confidential_match_text(hit)
+            and _normalize_confidential_match_text(hit) not in generic_marker_norms
+        ]
+        findings: List[RiskFinding] = []
+        protected_fields = list(policy.protected_fields or [])
+        sensitive_fields = [
+            "id",
+            "secret_content",
+            "secret_summary",
+            "secret_keywords",
+            "confidential_level",
+            "attack_paraphrases",
+        ]
+        for field_name in protected_fields + list(policy.sensitive_fields or []):
+            if field_name not in sensitive_fields:
+                sensitive_fields.append(field_name)
+
+        for asset in assets:
+            matched_fields: List[str] = []
+            asset_values: List[str] = [asset.id]
+            for field_name in sensitive_fields:
+                raw_value = asset.id if field_name == "id" else asset.extra.get(field_name, asset.get(field_name))
+                values = raw_value if isinstance(raw_value, list) else [raw_value]
+                for value in values:
+                    value_text = str(value or "").strip()
+                    if not value_text:
+                        continue
+                    asset_values.append(value_text)
+                    value_norm = _normalize_confidential_match_text(value_text)
+                    if value_text in raw_output or (value_norm and value_norm in output_norm):
+                        matched_fields.append(field_name)
+                        break
+
+            asset_blob_norm = _normalize_confidential_match_text(" ".join(asset_values))
+            if not matched_fields and any(hit_norm and hit_norm in asset_blob_norm for hit_norm in hit_norms):
+                matched_fields = protected_fields or ["secret_content"]
+
+            if not matched_fields or asset.id in existing_ids:
+                continue
+
+            findings.append(
+                RiskFinding(
+                    target_asset_id=asset.id,
+                    target_asset_name=asset.display_name(policy.display_field),
+                    risk_level="CRITICAL",
+                    score=100.0,
+                    reason="模型输出直接包含保密库受保护字段值。",
+                    restored_fact="",
+                    anchors=[],
+                    reduction_chain=[],
+                    minimal_combinations=[],
+                    finding_type="direct_protected_disclosure",
+                    target_asset_ids=[asset.id],
+                    restored_fields=sorted(set(matched_fields)),
+                    input_candidate_count=len(assets),
+                    final_candidate_count=1,
+                    information_gain_bits=0.0,
+                )
+            )
+
+        if not findings:
+            findings.append(
+                RiskFinding(
+                    target_asset_id="",
+                    target_asset_name="confidential_fact",
+                    risk_level="CRITICAL",
+                    score=100.0,
+                    reason="模型输出直接包含保密库受保护字段值。",
+                    restored_fact="",
+                    anchors=[],
+                    reduction_chain=[],
+                    minimal_combinations=[],
+                    finding_type="direct_protected_disclosure",
+                    target_asset_ids=[],
+                    restored_fields=protected_fields,
+                    input_candidate_count=len(assets),
+                    final_candidate_count=1,
+                    information_gain_bits=0.0,
+                )
+            )
+        return findings
+
+    def _write_confidential_audit_event(
+        self,
+        *,
+        request_id: str,
+        user_input: str,
+        model_output: str,
+        result: AnalysisResult,
+        direct_hits: List[str],
+        safe_answer_used: str,
+    ) -> None:
+        payload = self._build_confidential_audit_payload(
+            request_id=request_id,
+            user_input=user_input,
+            model_output=model_output,
+            result=result,
+            direct_hits=direct_hits,
+            safe_answer_used=safe_answer_used,
+        )
+        log_path = self._base_dir / "logs" / "confidential_audit.jsonl"
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        except OSError:
+            # Audit must not break user-facing safety; fail closed on response data
+            # by keeping sensitive details out of GatewayResponse regardless.
+            return
+
+    def _build_confidential_audit_payload(
+        self,
+        *,
+        request_id: str,
+        user_input: str,
+        model_output: str,
+        result: AnalysisResult,
+        direct_hits: List[str],
+        safe_answer_used: str,
+    ) -> Dict[str, Any]:
+        findings = list(result.findings or [])
+        restored_ids = sorted({
+            asset_id
+            for finding in findings
+            for asset_id in ([finding.target_asset_id] + list(finding.target_asset_ids or []))
+            if asset_id
+        })
+        trigger_types = sorted({finding.finding_type for finding in findings if finding.finding_type})
+        if direct_hits:
+            trigger_types.append("direct_confidential_value_match")
+        restored_fields = sorted({
+            field_name
+            for finding in findings
+            for field_name in list(finding.restored_fields or [])
+            if field_name
+        })
+        input_counts = [f.input_candidate_count for f in findings if f.input_candidate_count]
+        final_counts = [f.final_candidate_count for f in findings if f.final_candidate_count]
+        info_gains = [f.information_gain_bits for f in findings if f.information_gain_bits]
+        return {
+            "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "request_id": request_id,
+            "scenario": "confidential",
+            "user_input_hash": _sha256_text(user_input),
+            "llm_output_hash": _sha256_text(model_output),
+            "risk_detected": bool(findings or direct_hits),
+            "trigger_types": sorted(set(trigger_types)),
+            "restored_fact_ids": restored_ids,
+            "restored_fields": restored_fields,
+            "direct_hit_count": len(direct_hits),
+            "input_candidate_count": min(input_counts) if input_counts else 0,
+            "final_candidate_count": min(final_counts) if final_counts else 0,
+            "information_gain_bits": round(max(info_gains), 4) if info_gains else 0.0,
+            "safe_answer_used": safe_answer_used,
+        }
 
     # ------------------------------------------------------------------
     # Admin API: protected fact management
@@ -1247,6 +1571,16 @@ def _new_request_id() -> str:
     return f"req_{uuid.uuid4().hex[:12]}"
 
 
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()
+
+
+def _normalize_confidential_match_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(text or "")).lower()
+    normalized = re.sub(r"\s+", "", normalized)
+    return normalized
+
+
 def _build_response(
     request_id: str,
     result: AnalysisResult,
@@ -1257,6 +1591,7 @@ def _build_response(
     routed_scenario: str = "",
     answer_strategy: str = "",
     llm_debug_refs: Optional[List[Dict[str, Any]]] = None,
+    sensitive_response: bool = False,
 ) -> GatewayResponse:
     # Determine aggregate risk level and score
     if result.findings:
@@ -1271,19 +1606,22 @@ def _build_response(
         max_score = 0.0
         risk_level = "NONE"
 
-    # Build findings summary for UI display
+    # Build findings summary for UI display.  Confidential responses keep
+    # details backend-only because target IDs and reduction chains are evidence
+    # of restored protected facts.
     findings_summary = []
-    for f in result.findings:
-        findings_summary.append({
-            "target": f.target_asset_name or f.target_asset_id,
-            "target_id": f.target_asset_id,
-            "level": f.risk_level,
-            "score": f.score,
-            "reason": f.reason,
-            "restored": f.restored_fact,
-            "key_anchors": f.key_anchor_summary,
-            "chain": [s.to_dict() for s in f.reduction_chain],
-        })
+    if not sensitive_response:
+        for f in result.findings:
+            findings_summary.append({
+                "target": f.target_asset_name or f.target_asset_id,
+                "target_id": f.target_asset_id,
+                "level": f.risk_level,
+                "score": f.score,
+                "reason": f.reason,
+                "restored": f.restored_fact,
+                "key_anchors": f.key_anchor_summary,
+                "chain": [s.to_dict() for s in f.reduction_chain],
+            })
 
     return GatewayResponse(
         request_id=request_id,
@@ -1299,6 +1637,7 @@ def _build_response(
         routed_scenario=routed_scenario,
         answer_strategy=answer_strategy,
         llm_debug_refs=list(llm_debug_refs or []),
+        sensitive_response=sensitive_response,
     )
 
 

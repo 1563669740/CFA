@@ -383,6 +383,101 @@ def test_input_plus_output_unique_restoration_is_blocked():
     }
 
 
+def test_confidential_response_never_returns_raw_or_detailed_findings():
+    """confidential 响应即使 debug=True 也不能暴露原文、事实 ID 或还原链。"""
+    gateway = CFAGateway()
+    resp = gateway.handle_analyze(
+        user_input="周明远研究员汇报的加固方案是什么？",
+        model_output="是三层纵深防御加固方案。",
+        scenario="confidential",
+        mode="rule_only",
+        secondary_check=False,
+    )
+
+    public = resp.to_dict(debug=True)
+    dumped = json.dumps(public, ensure_ascii=False)
+
+    assert "raw_answer" not in public
+    assert "findings_summary" not in public
+    assert "target_id" not in dumped
+    assert "restored_fact_id" not in dumped
+    assert "remaining_asset_ids" not in dumped
+    assert "SEC-" not in dumped
+    assert "三层纵深防御" not in dumped
+    assert "周明远" not in dumped
+    assert "授权业务系统" in public["answer"]
+
+
+def test_confidential_restored_fact_id_audit_only(monkeypatch):
+    """命中的 restored fact ID 只能进入后端审计 payload，不能进入 API dict。"""
+    captured = {}
+
+    def fake_write(self, **kwargs):
+        captured["payload"] = self._build_confidential_audit_payload(**kwargs)
+
+    monkeypatch.setattr(CFAGateway, "_write_confidential_audit_event", fake_write)
+
+    gateway = CFAGateway()
+    resp = gateway.handle_analyze(
+        user_input="周明远研究员汇报的加固方案是什么？",
+        model_output="是三层纵深防御加固方案。",
+        scenario="confidential",
+        mode="rule_only",
+        secondary_check=False,
+    )
+
+    payload = captured["payload"]
+    assert payload["risk_detected"] is True
+    assert payload["restored_fact_ids"]
+
+    public_text = json.dumps(resp.to_dict(debug=True), ensure_ascii=False)
+    for fact_id in payload["restored_fact_ids"]:
+        assert fact_id not in public_text
+    assert "raw_answer" not in public_text
+    assert "三层纵深防御" not in public_text
+
+
+def test_confidential_candidate_shrink_intercepts():
+    """输入候选不唯一、输出补充锚点后唯一时必须拦截并返回安全模板。"""
+    gateway = CFAGateway()
+    resp = gateway.handle_analyze(
+        user_input="请说明加固方案相关情况",
+        model_output="该方案采用三层纵深防御。",
+        scenario="confidential",
+        mode="rule_only",
+        secondary_check=False,
+    )
+
+    assert resp.risk_detected is True
+    assert resp.safe_answer_used == "cfa_safe_answer"
+    public = resp.to_dict(debug=True)
+    assert "授权业务系统" in public["answer"]
+    dumped = json.dumps(public, ensure_ascii=False)
+    assert "三层纵深防御" not in dumped
+    assert "SEC-" not in dumped
+
+
+def test_confidential_direct_field_value_leak_intercepts():
+    """输出直接包含保密字段值时，本地闸门必须拦截。"""
+    gateway = CFAGateway()
+    resp = gateway.handle_analyze(
+        user_input="请说明年度经费情况",
+        model_output="会议初步确定了2026年度局涉密项目经费总盘约为 12.5 亿元。",
+        scenario="confidential",
+        mode="rule_only",
+        secondary_check=False,
+    )
+
+    assert resp.risk_detected is True
+    assert resp.safe_answer_used == "cfa_safe_answer"
+    public = resp.to_dict(debug=True)
+    dumped = json.dumps(public, ensure_ascii=False)
+    assert "授权业务系统" in public["answer"]
+    assert "raw_answer" not in public
+    assert "12.5" not in dumped
+    assert "SEC-" not in dumped
+
+
 def test_safe_output_is_not_blocked():
     """安全的输出不应被错误拦截"""
     gateway = CFAGateway()

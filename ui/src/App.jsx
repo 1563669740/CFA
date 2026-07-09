@@ -116,6 +116,10 @@ function OutputSection({ loading, error, result }) {
   }
 
   const riskCls = RISK_CLASS(result.risk_level);
+  const isConfidential = result.routed_scenario === 'confidential';
+  const publicFindings = (!isConfidential && Array.isArray(result.findings_summary))
+    ? result.findings_summary
+    : [];
 
   return (
     <div className="output-area">
@@ -174,8 +178,17 @@ function OutputSection({ loading, error, result }) {
         </div>
       )}
 
+      {isConfidential && result.risk_detected && (
+        <div className="answer-card" style={{ borderLeft: '3px solid var(--red)' }}>
+          <div className="card-title">🛡️ 保密场景已拦截</div>
+          <div className="card-body" style={{ fontSize: '0.88rem' }}>
+            本次回答可能使保密事实被唯一还原。系统仅展示公共安全响应，命中事实编号和还原链只写入后端审计日志。
+          </div>
+        </div>
+      )}
+
       {/* Risk Detail Cards */}
-      {result.findings_summary && result.findings_summary.map((f, idx) => (
+      {publicFindings.map((f, idx) => (
         <div key={idx} className="answer-card" style={{ borderLeft: `3px solid var(${f.level === 'CRITICAL' ? '--red' : f.level === 'HIGH' ? '--red' : '--yellow'})` }}>
           <div className="card-title">
             🔍 风险发现 #{idx + 1} — {f.level} — {f.target} ({f.target_id})
@@ -204,12 +217,12 @@ function OutputSection({ loading, error, result }) {
       ))}
 
       {/* Diff Comparison View */}
-      {result.raw_answer && result.answer && (
+      {!isConfidential && result.raw_answer && result.answer && (
         <DiffView rawAnswer={result.raw_answer} safeAnswer={result.answer} />
       )}
 
       {/* Raw Answer (LLM 原始输出) */}
-      {result.raw_answer && !result.answer && (
+      {!isConfidential && result.raw_answer && !result.answer && (
         <div className="answer-card">
           <div className="card-title">
             📝 LLM 原始输出
@@ -219,8 +232,8 @@ function OutputSection({ loading, error, result }) {
         </div>
       )}
 
-      {/* Safe Answer — only shown if no raw_answer for comparison */}
-      {result.answer && !result.raw_answer && (
+      {/* Safe Answer */}
+      {result.answer && (isConfidential || !result.raw_answer) && (
         <div className="answer-card">
           <div className="card-title">
             🔒 CFA 安全回答
@@ -235,6 +248,11 @@ function OutputSection({ loading, error, result }) {
         <summary style={{ cursor: 'pointer', fontSize: '0.85rem', color: 'var(--text-dim)', marginBottom: 8 }}>
           查看完整响应 JSON
         </summary>
+        {isConfidential && (
+          <div className="hint" style={{ marginBottom: 8 }}>
+            保密场景仅返回公共安全响应；原始输出、命中事实编号和还原链不会出现在前端响应中。
+          </div>
+        )}
         <div className="raw-json">{JSON.stringify(result, null, 2)}</div>
       </details>
     </div>
@@ -605,12 +623,18 @@ function ProtectedFactPanel({ currentScenario }) {
 /* ================================================================
    LLM Payload Debug Panel
    ================================================================ */
-function LlmPayloadPanel({ payload, error }) {
-  if (!payload && !error) return null;
+function LlmPayloadPanel({ payload, error, confidential }) {
+  if (!payload && !error && !confidential) return null;
 
   return (
     <details className="llm-payload-panel">
       <summary>🧾 查看发送给 LLM 的真实请求内容</summary>
+
+      {confidential && (
+        <div className="hint" style={{ marginBottom: 8 }}>
+          保密场景仅展示调试元信息；真实 payload 正文由后端安全过滤，不在前端展开。
+        </div>
+      )}
 
       {error && (
         <div className="error-banner">
@@ -634,9 +658,11 @@ function LlmPayloadPanel({ payload, error }) {
             <span>接口：{payload.base_url}</span>
           </div>
 
-          <pre className="llm-payload-code">
-            {JSON.stringify(payload.payload, null, 2)}
-          </pre>
+          {!confidential && (
+            <pre className="llm-payload-code">
+              {JSON.stringify(payload.payload, null, 2)}
+            </pre>
+          )}
         </>
       )}
     </details>
@@ -697,8 +723,9 @@ export default function App() {
       }
       setResult(data);
 
-      // 只有对话模式会调用 LLM 生成，按当前 request_id 读取真实 payload
-      if (mode === 'chat') {
+      // 只有对话模式会调用 LLM 生成，按当前 request_id 读取真实 payload。
+      // 保密场景不主动拉取 payload 正文，仅保留后端返回的安全元信息。
+      if (mode === 'chat' && data.routed_scenario !== 'confidential') {
         try {
           const primaryRef = (data.llm_debug_refs || []).find((ref) => ref.purpose === 'primary_generation');
           const payloadData = await fetchLastLlmPayload({
@@ -875,7 +902,11 @@ export default function App() {
         {/* Right Panel: Output */}
         <div className="panel-right">
           <OutputSection loading={loading} error={error} result={result} />
-          <LlmPayloadPanel payload={llmPayload} error={llmPayloadError} />
+          <LlmPayloadPanel
+            payload={llmPayload}
+            error={llmPayloadError}
+            confidential={result?.routed_scenario === 'confidential'}
+          />
         </div>
       </div>
     </>

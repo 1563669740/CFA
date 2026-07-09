@@ -134,7 +134,7 @@ class _CFAHandler(BaseHTTPRequestHandler):
                 mode=mode,
                 secondary_check=secondary_check,
             )
-            self._respond(200, resp.to_dict(debug=True))
+            self._respond(200, resp.to_dict(debug=False))
         except ValueError as exc:
             self._respond(400, {"error": str(exc)})
         except Exception as exc:
@@ -165,7 +165,7 @@ class _CFAHandler(BaseHTTPRequestHandler):
                 mode=mode,
                 secondary_check=secondary_check,
             )
-            self._respond(200, resp.to_dict(debug=True))
+            self._respond(200, resp.to_dict(debug=False))
         except ValueError as exc:
             self._respond(400, {"error": str(exc)})
         except Exception as exc:

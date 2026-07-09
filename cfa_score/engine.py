@@ -1430,6 +1430,43 @@ class CFAScoreEngine:
             if a.protected and not a.inferred
         ]
         if protected_output:
+            # Direct disclosure: build an aggregate finding when one claim binds to one
+            # concrete asset, then keep per-anchor findings for field-level redaction.
+            if len(claim.candidate_assets) == 1:
+                aggregate_asset = claim.candidate_assets[0]
+                aggregate_anchors = self._anchors_matching_asset(
+                    aggregate_asset,
+                    protected_output,
+                    anchor_by_id,
+                )
+                aggregate_fields = sorted({a.field_name for a in aggregate_anchors if a.protected})
+                if len(aggregate_fields) >= 2:
+                    aggregate_score = min(
+                        100.0,
+                        max(self._score_direct_disclosure(a) for a in aggregate_anchors) + 5.0,
+                    )
+                    findings.append(
+                        RiskFinding(
+                            target_asset_id=aggregate_asset.id,
+                            target_asset_name=aggregate_asset.display_name(self.policy.display_field),
+                            risk_level=self._risk_level(aggregate_score),
+                            score=aggregate_score,
+                            reason="模型输出直接包含多项受限字段信息。",
+                            restored_fact=self._restored_fact(aggregate_asset, aggregate_anchors),
+                            anchors=aggregate_anchors,
+                            reduction_chain=self._reduction_chain(aggregate_anchors, anchor_by_id),
+                            minimal_combinations=[[a.id for a in aggregate_anchors]],
+                            key_anchor_ids=[a.id for a in aggregate_anchors],
+                            key_anchor_summary=self._summarize_key_anchors(aggregate_anchors),
+                            finding_type="direct_protected_disclosure",
+                            target_asset_ids=[aggregate_asset.id],
+                            restored_fields=aggregate_fields,
+                            input_candidate_count=len(self.assets),
+                            final_candidate_count=1,
+                            information_gain_bits=0.0,
+                        )
+                    )
+
             # Direct disclosure: findings per protected anchor
             for anchor in protected_output:
                 score = self._score_direct_disclosure(anchor)

@@ -2341,12 +2341,7 @@
   "min_information_gain_bits": 0.5,
   "protected_value_k": 1,
   "min_protected_entropy_drop_bits": 0.5,
-  "llm_extraction_fields": [
-    "secret_content",
-    "secret_summary",
-    "secret_keywords",
-    "confidential_level"
-  ],
+  "llm_extraction_fields": [],
   "llm_confidence_threshold": 0.4,
-  "llm_max_accepted_values": 30
+  "llm_max_accepted_values": 0
 }

@@ -543,7 +543,21 @@ function ProtectedFactPanel({ currentScenario }) {
 
       {factsInfo && (
         <div className="fact-count">
-          当前场景已有事实：{factsInfo.count} 条
+          <div>当前场景已有事实：{factsInfo.count} 条</div>
+          {factsInfo.import_meta && (
+            <div className="import-meta">
+              <div>
+                最近一次导入：成功 {factsInfo.import_meta.imported} 条，
+                重复 {factsInfo.import_meta.duplicates} 条，
+                错误 {factsInfo.import_meta.error_count} 行，
+                导入后总数 {factsInfo.import_meta.total_facts} 条
+              </div>
+              <div>
+                文件：{factsInfo.import_meta.filename || '未命名'}；
+                时间：{factsInfo.import_meta.imported_at || '-'}
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -608,6 +622,14 @@ function LlmPayloadPanel({ payload, error }) {
         <>
           <div className="llm-payload-meta">
             <span>捕获时间：{payload.captured_at}</span>
+            <span>请求 ID：{payload.request_id || '-'}</span>
+            <span>调用目的：{payload.purpose || '-'}</span>
+            <span>场景：{payload.scenario || '-'}</span>
+            <span>实际路由：{payload.effective_scenario || '-'}</span>
+            <span>模式：{payload.mode || '-'}</span>
+            <span>二次检测：{payload.secondary_check ? '是' : '否'}</span>
+            <span>注入事实池：{payload.inject_fact_pool ? '是' : '否'}</span>
+            <span>安全知识库：{payload.safe_knowledge_type || '无'}</span>
             <span>模型：{payload.model}</span>
             <span>接口：{payload.base_url}</span>
           </div>
@@ -675,13 +697,17 @@ export default function App() {
       }
       setResult(data);
 
-      // 只有对话模式会调用 LLM 生成，读取真实 payload
+      // 只有对话模式会调用 LLM 生成，按当前 request_id 读取真实 payload
       if (mode === 'chat') {
         try {
-          const payloadData = await fetchLastLlmPayload();
+          const primaryRef = (data.llm_debug_refs || []).find((ref) => ref.purpose === 'primary_generation');
+          const payloadData = await fetchLastLlmPayload({
+            requestId: primaryRef?.request_id || data.request_id,
+            purpose: primaryRef?.purpose || 'primary_generation',
+          });
           setLlmPayload(payloadData);
         } catch (e) {
-          setLlmPayloadError(e.message || '读取 LLM 请求内容失败');
+          setLlmPayloadError(e.message || '本次请求没有捕获到对应的 LLM 请求');
         }
       }
     } catch (err) {

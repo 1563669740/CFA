@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -57,24 +58,58 @@ class DeepSeekAdapter(LLMAdapter):
 
     def generate(self, user_input: str, context: dict[str, Any] | None = None) -> str:
         ctx = context or {}
-        fact_pool: Sequence[AssetFact] = ctx.get("fact_pool", [])
-        public_knowledge: Sequence[Mapping[str, Any]] = ctx.get("public_knowledge", [])
+
+        # P0 安全修复：默认禁止 fact_pool 上传到外部 LLM
+        # 只有显式设置 allow_fact_pool_to_llm=True 时才允许注入内部资产台账
+        allow_fact_pool_to_llm = bool(ctx.get("allow_fact_pool_to_llm", False))
+
+        fact_pool: Sequence[AssetFact] = (
+            ctx.get("fact_pool", []) if allow_fact_pool_to_llm else []
+        )
+        public_knowledge: Sequence[Mapping[str, Any]] = (
+            ctx.get("public_knowledge", []) if allow_fact_pool_to_llm else []
+        )
         policy = ctx.get("policy")
+        safe_knowledge = ctx.get("safe_knowledge")
+
+        user_blocks = [
+            f"〖用户问题〗\n{user_input}",
+        ]
+
+        if allow_fact_pool_to_llm:
+            user_blocks.extend([
+                f"〖公开漏洞情报〗\n{_format_public_knowledge(public_knowledge)}",
+                f"〖内部资产台账〗\n{_format_fact_pool(fact_pool, policy)}",
+            ])
+        else:
+            user_blocks.append(
+                "〖安全约束〗\n当前请求不提供内部数据原文。"
+                "如涉及内部敏感数据，只能给出概括性说明，"
+                "并提示用户通过授权系统查询。"
+            )
+
+        if safe_knowledge:
+            user_blocks.append(
+                "〖安全知识库摘要〗\n"
+                f"{_format_safe_knowledge(safe_knowledge)}"
+            )
+
+        user_blocks.append("请基于以上约束回答用户的问题。")
 
         messages: list[dict[str, str]] = [
             {"role": "system", "content": self._system_prompt},
-            {
-                "role": "user",
-                "content": "\n\n".join(
-                    [
-                        f"【用户问题】\n{user_input}",
-                        f"【公开漏洞情报】\n{_format_public_knowledge(public_knowledge)}",
-                        f"【内部资产台账】\n{_format_fact_pool(fact_pool, policy)}",
-                        "请基于以上信息回答用户的问题。",
-                    ]
-                ),
-            },
+            {"role": "user", "content": "\n\n".join(user_blocks)},
         ]
+
+        debug_metadata = ctx.get("debug_metadata")
+        if debug_metadata is not None:
+            try:
+                return self._client.chat(messages, debug_metadata=debug_metadata)
+            except TypeError as exc:
+                # Some tests monkeypatch chat() with the historical signature.
+                # Fall back only for that compatibility case.
+                if "debug_metadata" not in str(exc):
+                    raise
         return self._client.chat(messages)
 
 
@@ -91,13 +126,22 @@ def generate_answer(
 ) -> str:
     """Convenience wrapper that keeps the original signature.
 
+    P0 安全修复：不再支持 fact_pool 注入。
+    如果调用方传入了非空 fact_pool，直接抛出异常。
+
     Prefer using :class:`DeepSeekAdapter` directly in new code.
     """
+    if fact_pool:
+        raise RuntimeError(
+            "generate_answer() no longer supports fact_pool injection. "
+            "Call DeepSeekAdapter.generate() directly with allow_fact_pool_to_llm=True "
+            "if you are certain the content is NOT confidential."
+        )
+
     adapter = DeepSeekAdapter(env_path=env_path)
     return adapter.generate(
         user_input,
         context={
-            "fact_pool": list(fact_pool),
             "public_knowledge": list(public_knowledge_rules),
             "policy": policy,
         },
@@ -107,6 +151,13 @@ def generate_answer(
 # ---------------------------------------------------------------------------
 # Formatting helpers
 # ---------------------------------------------------------------------------
+
+def _format_safe_knowledge(safe_knowledge: Any) -> str:
+    """Format a sanitized knowledge summary for LLM prompts."""
+    if isinstance(safe_knowledge, str):
+        return safe_knowledge
+    return json.dumps(safe_knowledge, ensure_ascii=False, indent=2)
+
 
 def _format_public_knowledge(rules: Sequence[Mapping[str, Any]]) -> str:
     """Format public knowledge rules as human-readable text."""

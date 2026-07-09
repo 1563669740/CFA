@@ -85,8 +85,13 @@ export async function addProtectedFact({ scenario, fact }) {
 }
 
 /** GET /api/debug/last-llm-payload */
-export async function fetchLastLlmPayload() {
-  const res = await fetch(`${BASE}/debug/last-llm-payload`);
+export async function fetchLastLlmPayload({ requestId, purpose } = {}) {
+  const params = new URLSearchParams();
+  if (requestId) params.set('request_id', requestId);
+  if (purpose) params.set('purpose', purpose);
+
+  const suffix = params.toString() ? `?${params.toString()}` : '';
+  const res = await fetch(`${BASE}/debug/last-llm-payload${suffix}`);
 
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));

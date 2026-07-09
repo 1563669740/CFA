@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from .adapter import DeepSeekAdapter
+from .deepseek import _assert_no_confidential_prompt
 from .engine import CFAScoreEngine
 from .knowledge import dump_json, load_assets, load_policy, load_public_knowledge, merge_public_knowledge
 
@@ -68,6 +69,9 @@ def main(argv: list[str] | None = None) -> int:
                     "fact_pool": assets,
                     "public_knowledge": public_rules,
                     "policy": policy,
+                    # P0 安全：通过 _assert_no_confidential_prompt 在底层拦截
+                    # 但如果调用方确实在使用 confidential assets，底层会直接阻断
+                    "allow_fact_pool_to_llm": True,
                 },
             )
             answer_mode = "deepseek"

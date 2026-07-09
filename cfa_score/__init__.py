@@ -1,5 +1,6 @@
 ﻿from .adapter import DeepSeekAdapter, LLMAdapter, generate_answer
 from .anchor_verifier import AnchorVerifier
+from .confidential_local import ConfidentialLocalService
 from .engine import CFAScoreEngine, ExtractionMode
 from .gateway import CFAGateway, GatewayResponse
 from .knowledge import load_assets, load_policy, load_public_knowledge, load_semantic_aliases, merge_public_knowledge
@@ -27,4 +28,6 @@ __all__ = [
     "AnchorVerifier",
     "load_semantic_aliases",
     "SemanticIndex",
+    # Confidential local service
+    "ConfidentialLocalService",
 ]

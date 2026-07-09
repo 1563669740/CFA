@@ -76,7 +76,7 @@ class _CFAHandler(BaseHTTPRequestHandler):
         elif path == "/api/protected-facts":
             self._list_protected_facts(parsed)
         elif path == "/api/debug/last-llm-payload":
-            self._debug_last_llm_payload()
+            self._debug_last_llm_payload(parsed)
         else:
             self._not_found()
 
@@ -250,27 +250,83 @@ class _CFAHandler(BaseHTTPRequestHandler):
     # Debug endpoints
     # ------------------------------------------------------------------
 
-    def _debug_last_llm_payload(self) -> None:
+    def _debug_last_llm_payload(self, parsed=None) -> None:
         """
-        调试接口：返回最近一次真实发给 LLM 的 payload。
-        仅用于本地开发/汇报演示，生产环境必须关闭或加管理员鉴权。
+        调试接口：返回真实发给 LLM 的 payload。
+        支持 request_id + purpose 精确查询当前对话对应的 payload。
         """
         root = Path(__file__).resolve().parent.parent
-        path = root / "logs" / "last_llm_payload.json"
+        parsed = parsed or urlparse(self.path)
+        query = parse_qs(parsed.query)
+        request_id = query.get("request_id", [""])[0]
+        purpose = query.get("purpose", [""])[0]
 
-        if not path.exists():
-            self._respond(404, {
-                "error": "还没有捕获到 LLM 请求。请先在对话模式发送一次请求。"
-            })
-            return
+        if request_id:
+            path = self._find_request_debug_payload(root, request_id, purpose)
+            if path is None:
+                self._respond(404, {
+                    "error": "当前请求没有捕获到对应的 LLM 请求。可能未开启 CFA_DEBUG_LLM_PAYLOAD，或该请求未调用外部 LLM。"
+                })
+                return
+        else:
+            path = root / "logs" / "last_llm_payload.json"
+            if not path.exists():
+                self._respond(404, {
+                    "error": "还没有捕获到 LLM 请求。请先在对话模式发送一次请求。"
+                })
+                return
 
         try:
-            data = json.loads(path.read_text(encoding="utf-8-sig"))
+            raw = path.read_text(encoding="utf-8-sig")
+            data = json.loads(raw)
+
+            # P0 安全：payload 中不得包含保密库敏感标记
+            confidential_markers = [
+                "SEC-", "保密内容=", "保密关键词=", "保密类别=", "保密摘要=",
+                "保密事实库", "密级=", "机密★", "绝密★", "秘密★",
+                "【内部资产台账】",
+            ]
+            raw_lower = raw.lower()
+            if any(m in raw for m in confidential_markers) or any(m.lower() in raw_lower for m in confidential_markers):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                self._respond(403, {
+                    "error": "debug payload 包含保密库标记，已自动删除。"
+                            "请重新发起一次安全的对话请求以生成新的 debug payload。"
+                })
+                return
+
             self._respond(200, data)
+        except json.JSONDecodeError:
+            self._respond(500, {"error": "debug payload JSON 解析失败"})
         except Exception as exc:
             self._respond(500, {
                 "error": f"读取 LLM payload 失败: {exc}"
             })
+
+    def _find_request_debug_payload(self, root: Path, request_id: str, purpose: str = "") -> Optional[Path]:
+        safe_request_id = _safe_debug_name(request_id)
+        debug_dir = root / "logs" / "llm_payloads" / safe_request_id
+        if not debug_dir.exists():
+            return None
+
+        files = sorted(debug_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not files:
+            return None
+
+        if purpose:
+            for path in files:
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8-sig"))
+                except Exception:
+                    continue
+                if data.get("request_id") == request_id and data.get("purpose") == purpose:
+                    return path
+            return None
+
+        return files[0]
 
     # ------------------------------------------------------------------
     # Helpers
@@ -318,6 +374,11 @@ class _CFAHandler(BaseHTTPRequestHandler):
 
     def _not_found(self) -> None:
         self._respond(404, {"error": "Not found"})
+
+
+def _safe_debug_name(value: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in "_-" else "_" for ch in str(value))
+    return cleaned[:80] or "llm_call"
 
 
 # ---------------------------------------------------------------------------

@@ -29,10 +29,11 @@ import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Mapping
 
 from .adapter import DeepSeekAdapter
-from .deepseek import DeepSeekClient, config_from_env
+from .confidential_local import ConfidentialLocalService
+from .deepseek import DeepSeekClient, config_from_env, _assert_no_confidential_prompt
 from .engine import CFAScoreEngine, ExtractionMode
 from .intent_router import (
     classify_intent,
@@ -71,6 +72,7 @@ class GatewayResponse:
     intent: str = ""            # classified intent domain
     routed_scenario: str = ""   # the scenario that actually handled the request
     answer_strategy: str = ""   # "cfa_gated" | "general_answer" | "weather_answer" | "need_city_prompt"
+    llm_debug_refs: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self, debug: bool = False) -> Dict[str, Any]:
         """Serialize to dict.  ``debug=True`` includes raw_answer and findings_summary."""
@@ -85,6 +87,7 @@ class GatewayResponse:
             "intent": self.intent,
             "routed_scenario": self.routed_scenario,
             "answer_strategy": self.answer_strategy,
+            "llm_debug_refs": self.llm_debug_refs,
         }
         if debug:
             data["raw_answer"] = self.raw_answer
@@ -212,11 +215,11 @@ class CFAGateway:
                 "- 不要输出 JSON 格式，不要解释你是如何分析的"
             ),
             "confidential": (
-                "你是一个内部保密信息管理助手，接入了保密事实库。"
-                "当用户询问保密库相关内容时，你只能给出安全、概括性的回答。\n"
+                "你是一个内部信息合规助手，接入的是已脱敏的安全知识库摘要。"
+                "当用户询问内部敏感事项时，你只能给出安全、概括性的回答。\n"
                 "注意：\n"
-                "- 不要直接输出保密事实正文、保密摘要、保密关键词或密级\n"
-                "- 如果用户询问具体保密内容，应说明相关内容需要通过授权系统查询\n"
+                "- 不要直接输出内部敏感事实正文、摘要、关键词或等级\n"
+                "- 如果用户询问具体内部内容，应说明相关内容需要通过授权系统查询\n"
                 "- 回答应简洁、正式，控制在 2-4 句话以内\n"
                 "- 不要输出 JSON 格式，不要解释你是如何分析的"
             ),
@@ -265,10 +268,39 @@ class CFAGateway:
 
         # ---- Step 2: Call LLM to generate raw_answer with domain boundary ----
         system_prompt = self._build_system_prompt(effective_scenario)
-        raw_answer = self._call_llm_with_prompt(
-            user_input, system_prompt, assets, policy,
-            inject_fact_pool=True,
-        )
+
+        llm_debug_refs: List[Dict[str, Any]] = []
+        if effective_scenario == "confidential":
+            # 保密场景只把脱敏聚合知识库发给外部 LLM；原始 assets/fact_pool 不外发。
+            raw_answer, llm_debug_refs = self._build_confidential_llm_answer(
+                user_input=user_input,
+                assets=assets,
+                policy=policy,
+                request_id=request_id,
+                scenario=scenario,
+                mode=mode,
+                secondary_check=secondary_check,
+            )
+        else:
+            debug_ref = {
+                "request_id": request_id,
+                "purpose": "primary_generation",
+                "scenario": scenario,
+                "effective_scenario": effective_scenario,
+                "mode": mode,
+                "secondary_check": secondary_check,
+                "inject_fact_pool": True,
+                "safe_knowledge_type": "",
+            }
+            raw_answer = self._call_llm_with_prompt(
+                user_input,
+                system_prompt,
+                assets,
+                policy,
+                inject_fact_pool=True,
+                debug_metadata=debug_ref,
+            )
+            llm_debug_refs = [debug_ref]
 
         # ---- Step 3: Run CFA-Score analysis ----
         result = self._run_cfa(
@@ -290,6 +322,7 @@ class CFAGateway:
             intent=intent_info.domain,
             routed_scenario=effective_scenario,
             answer_strategy="cfa_gated",
+            llm_debug_refs=llm_debug_refs,
         )
 
     def handle_analyze(
@@ -387,6 +420,12 @@ class CFAGateway:
         policy: FieldPolicy,
     ) -> str:
         """Generate raw_answer via DeepSeek (or compatible) LLM."""
+        # P0 安全加固：保密场景绝对不能把 assets 发给外部 LLM
+        if scenario == "confidential":
+            raise RuntimeError(
+                "INTERNAL ERROR: _call_llm must not be invoked for confidential scenario. "
+                "Use _build_confidential_safe_answer() instead."
+            )
         system_prompt = self._system_prompts.get(scenario)
         adapter = DeepSeekAdapter(
             env_path=self._env_path,
@@ -400,6 +439,7 @@ class CFAGateway:
                 "fact_pool": assets,
                 "public_knowledge": public_knowledge,
                 "policy": policy,
+                "allow_fact_pool_to_llm": True,
             },
         )
 
@@ -419,6 +459,11 @@ class CFAGateway:
         secondary_check: bool,
     ) -> AnalysisResult:
         """Create engine, run analyze, return result."""
+        # P0 安全修复：保密场景禁止 LLM 语义抽取、禁止 LLM 二次改写
+        # 候选敏感值（如 secret_content）本身也是保密信息，不能交给 LLM
+        if scenario == "confidential":
+            mode = "rule_only"
+            secondary_check = False
         extraction_mode = (
             ExtractionMode.RULE_PLUS_LLM if mode == "rule_plus_llm" else ExtractionMode.RULE_ONLY
         )
@@ -480,6 +525,8 @@ class CFAGateway:
         assets: List[AssetFact],
         policy: FieldPolicy,
         inject_fact_pool: bool = True,
+        safe_knowledge: Mapping[str, Any] | str | None = None,
+        debug_metadata: Mapping[str, Any] | None = None,
     ) -> str:
         """Generate raw_answer via DeepSeek with explicit system prompt control.
 
@@ -491,6 +538,14 @@ class CFAGateway:
             inject_fact_pool: If False, do NOT inject internal asset data.
                              Used for general chat to avoid unnecessary data exposure.
         """
+        # P0 安全加固：保密/合规场景绝对不能上传 raw fact_pool，即使调用方误传 inject_fact_pool=True
+        if system_prompt and (
+            "内部保密信息管理助手" in system_prompt
+            or "内部信息合规助手" in system_prompt
+            or "已脱敏的安全知识库摘要" in system_prompt
+        ):
+            inject_fact_pool = False
+
         adapter = DeepSeekAdapter(
             env_path=self._env_path,
             system_prompt=system_prompt,
@@ -500,8 +555,211 @@ class CFAGateway:
             "fact_pool": assets if inject_fact_pool else [],
             "public_knowledge": public_knowledge if inject_fact_pool else [],
             "policy": policy,
+            "allow_fact_pool_to_llm": bool(inject_fact_pool),
+            "safe_knowledge": safe_knowledge,
+            "debug_metadata": dict(debug_metadata or {}),
         }
         return adapter.generate(user_input, context=context)
+
+    def _build_confidential_safe_answer(self, user_input: str) -> str:
+        """
+        本地保密库安全模板 fallback。
+        不返回内部敏感事实正文、摘要、关键词、等级、SEC 编号。
+        """
+        assets, policy = self._load_scenario("confidential")
+        service = ConfidentialLocalService(assets=assets, policy=policy)
+        decision = service.classify_and_match(user_input)
+        sub_scene = decision.get("sub_scene", "confidential_general") if decision.get("matched") else "confidential_general"
+        return ConfidentialLocalService.get_safe_template(sub_scene)
+
+    def _build_confidential_llm_answer(
+        self,
+        *,
+        user_input: str,
+        assets: List[AssetFact],
+        policy: FieldPolicy,
+        request_id: str,
+        scenario: str,
+        mode: str,
+        secondary_check: bool,
+    ) -> tuple[str, List[Dict[str, Any]]]:
+        """Use a sanitized confidential KB summary for primary LLM generation."""
+        safe_knowledge = self._build_sanitized_confidential_llm_kb(user_input, assets, policy)
+        self._assert_sanitized_confidential_kb_safe(safe_knowledge, assets, policy)
+
+        sub_scene = safe_knowledge.get("current_query", {}).get("safe_topic", "confidential_general")
+        fallback = ConfidentialLocalService.get_safe_template(str(sub_scene))
+        debug_ref = {
+            "request_id": request_id,
+            "purpose": "primary_generation",
+            "scenario": scenario,
+            "effective_scenario": "confidential",
+            "mode": mode,
+            "secondary_check": secondary_check,
+            "inject_fact_pool": False,
+            "safe_knowledge_type": safe_knowledge.get("kb_type", "sanitized_confidential_summary"),
+        }
+
+        try:
+            answer = self._call_llm_with_prompt(
+                self._build_confidential_llm_query(safe_knowledge),
+                self._build_system_prompt("confidential"),
+                [],
+                policy,
+                inject_fact_pool=False,
+                safe_knowledge=safe_knowledge,
+                debug_metadata=debug_ref,
+            )
+        except Exception:
+            return fallback, []
+
+        if not self._is_confidential_text_safe(answer, assets, policy):
+            return fallback, [debug_ref]
+        return answer, [debug_ref]
+
+    def _build_confidential_llm_query(self, safe_knowledge: Mapping[str, Any]) -> str:
+        current_query = safe_knowledge.get("current_query", {}) if isinstance(safe_knowledge, Mapping) else {}
+        related = bool(current_query.get("related"))
+        safe_topic = str(current_query.get("safe_topic") or "confidential_general")
+        return (
+            "用户正在询问内部敏感信息。"
+            f"本地安全检索结果：related={related}，safe_topic={safe_topic}。"
+            "请只根据安全知识库摘要和回答策略生成概括性答复，不要猜测或补充任何具体内部事实。"
+        )
+
+    def _build_sanitized_confidential_llm_kb(
+        self,
+        user_input: str,
+        assets: List[AssetFact],
+        policy: FieldPolicy,
+    ) -> Dict[str, Any]:
+        """Build a deterministic, no-raw-secret KB summary that is safe for LLM prompts."""
+        service = ConfidentialLocalService(assets=assets, policy=policy)
+        decision = service.classify_and_match(user_input)
+        coverage = {
+            "confidential_project": 0,
+            "confidential_system": 0,
+            "confidential_personnel": 0,
+            "confidential_finance": 0,
+            "confidential_security_audit": 0,
+            "confidential_general": 0,
+        }
+        for asset in assets:
+            sub_scene = service._infer_sub_scene(asset, "")  # local deterministic classifier; no value is exposed
+            coverage[sub_scene] = coverage.get(sub_scene, 0) + 1
+
+        matched_count = int(decision.get("match_count") or 0)
+        if matched_count <= 0:
+            bucket = "0"
+        elif matched_count == 1:
+            bucket = "1"
+        elif matched_count <= 5:
+            bucket = "2-5"
+        else:
+            bucket = ">5"
+
+        safe_topic = str(decision.get("sub_scene") or "confidential_general")
+        if safe_topic not in coverage:
+            safe_topic = "confidential_general"
+
+        return {
+            "kb_type": "sanitized_confidential_summary",
+            "version": 1,
+            "total_records": len(assets),
+            "coverage": coverage,
+            "current_query": {
+                "related": bool(decision.get("matched")),
+                "safe_topic": safe_topic,
+                "matched_count_bucket": bucket,
+            },
+            "answer_policy": [
+                "只能说明系统中存在相关内部敏感信息",
+                "不能输出具体项目、人员、金额、部署、等级、原文、摘要或关键词",
+                "应引导用户通过授权业务系统按权限查询",
+            ],
+        }
+
+    def _assert_sanitized_confidential_kb_safe(
+        self,
+        kb: Mapping[str, Any],
+        assets: List[AssetFact],
+        policy: FieldPolicy,
+    ) -> None:
+        raw = json.dumps(kb, ensure_ascii=False, sort_keys=True)
+        self._assert_no_confidential_text(raw, assets, policy)
+        # Reuse the outbound-prompt marker guard with the serialized KB.
+        _assert_no_confidential_prompt([{"role": "user", "content": raw}])
+
+    def _is_confidential_text_safe(
+        self,
+        text: str,
+        assets: List[AssetFact],
+        policy: FieldPolicy,
+    ) -> bool:
+        try:
+            self._assert_no_confidential_text(text, assets, policy)
+            _assert_no_confidential_prompt([{"role": "assistant", "content": text}])
+            return True
+        except RuntimeError:
+            return False
+
+    def _assert_no_confidential_text(
+        self,
+        text: str,
+        assets: List[AssetFact],
+        policy: FieldPolicy,
+    ) -> None:
+        forbidden_markers = [
+            "SEC-", "保密内容=", "保密关键词=", "保密类别=", "保密摘要=",
+            "保密事实库", "密级=", "机密★", "绝密★", "秘密★",
+            "【内部资产台账】",
+        ]
+        hits = [marker for marker in forbidden_markers if marker in text]
+        for value in self._iter_confidential_sensitive_values(assets, policy):
+            if value and value in text:
+                hits.append(value)
+        if hits:
+            raise RuntimeError(f"Blocked confidential text leakage: {hits[:10]}")
+
+    def _iter_confidential_sensitive_values(
+        self,
+        assets: List[AssetFact],
+        policy: FieldPolicy,
+    ) -> List[str]:
+        values: List[str] = []
+        fields = [
+            "id",
+            "secret_content",
+            "secret_summary",
+            "secret_keywords",
+            "confidential_level",
+            "attack_paraphrases",
+        ]
+        for asset in assets:
+            for field_name in fields:
+                raw_value = asset.id if field_name == "id" else asset.extra.get(field_name, asset.get(field_name))
+                if isinstance(raw_value, list):
+                    values.extend(str(item).strip() for item in raw_value)
+                else:
+                    values.append(str(raw_value or "").strip())
+
+        secret_aliases = (policy.field_aliases or {}).get("secret_content", {})
+        if isinstance(secret_aliases, dict):
+            for canonical, aliases in secret_aliases.items():
+                values.append(str(canonical or "").strip())
+                if isinstance(aliases, list):
+                    values.extend(str(item).strip() for item in aliases if len(str(item).strip()) >= 4)
+
+        deduped: List[str] = []
+        seen = set()
+        for value in values:
+            # Very short/common labels (for example "内部" or "high") create false positives
+            # in safe aggregate policy text. Keep strong identifiers regardless of length.
+            if (len(value) < 4 and not value.startswith("SEC-")) or value in seen:
+                continue
+            seen.add(value)
+            deduped.append(value)
+        return deduped
 
     def _handle_general_chat(
         self,
@@ -534,6 +792,16 @@ class CFAGateway:
         raw_answer = self._call_llm_with_prompt(
             user_input, system_prompt, [], empty_policy,
             inject_fact_pool=False,
+            debug_metadata={
+                "request_id": request_id,
+                "purpose": "primary_generation",
+                "scenario": "general",
+                "effective_scenario": "general",
+                "mode": mode,
+                "secondary_check": False,
+                "inject_fact_pool": False,
+                "safe_knowledge_type": "",
+            },
         )
 
         # Determine answer strategy label
@@ -557,6 +825,16 @@ class CFAGateway:
             intent=intent_info.domain,
             routed_scenario="general",
             answer_strategy=strategy,
+            llm_debug_refs=[{
+                "request_id": request_id,
+                "purpose": "primary_generation",
+                "scenario": "general",
+                "effective_scenario": "general",
+                "mode": mode,
+                "secondary_check": False,
+                "inject_fact_pool": False,
+                "safe_knowledge_type": "",
+            }],
         )
 
     # ------------------------------------------------------------------
@@ -583,6 +861,24 @@ class CFAGateway:
     # ------------------------------------------------------------------
     # Admin API: protected fact management
     # ------------------------------------------------------------------
+
+    def _get_confidential_import_meta_path(self) -> Path:
+        return self._base_dir / "config" / "confidential_import_meta.json"
+
+    def _read_confidential_import_meta(self) -> Optional[dict]:
+        path = self._get_confidential_import_meta_path()
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def _write_confidential_import_meta(self, meta: dict) -> None:
+        path = self._get_confidential_import_meta_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _get_scenario_files(self, scenario: str) -> tuple:
         """Return (facts_path, policy_path) for a scenario without loading/caching."""
@@ -646,11 +942,14 @@ class CFAGateway:
         if not isinstance(data, list):
             raise ValueError("facts json must be a list")
 
-        return {
+        result = {
             "scenario": scenario,
             "count": len(data),
             "facts": data,
         }
+        if scenario == "confidential":
+            result["import_meta"] = self._read_confidential_import_meta()
+        return result
 
     def add_protected_fact(self, scenario: str, fact: dict) -> dict:
         """Append a new fact to the scenario's facts JSON file.
@@ -905,6 +1204,20 @@ class CFAGateway:
             encoding="utf-8"
         )
 
+        import_meta = {
+            "filename": filename,
+            "imported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "total_lines": len(raw_lines),
+            "parsed": len(imported),
+            "imported": len(final_imported),
+            "duplicates": duplicate_count,
+            "error_count": len(errors),
+            "total_facts": len(final_facts),
+            "category_counter": category_counter,
+            "level_counter": level_counter,
+        }
+        self._write_confidential_import_meta(import_meta)
+
         # 关键：清除缓存，否则新导入的事实不会立即生效
         self._scenario_cache.pop(scenario, None)
 
@@ -921,6 +1234,7 @@ class CFAGateway:
             "total_facts": len(final_facts),
             "category_counter": category_counter,
             "level_counter": level_counter,
+            "import_meta": import_meta,
             "message": f"成功导入 {len(final_imported)} 条保密事实"
         }
 
@@ -942,6 +1256,7 @@ def _build_response(
     intent: str = "",
     routed_scenario: str = "",
     answer_strategy: str = "",
+    llm_debug_refs: Optional[List[Dict[str, Any]]] = None,
 ) -> GatewayResponse:
     # Determine aggregate risk level and score
     if result.findings:
@@ -983,6 +1298,7 @@ def _build_response(
         intent=intent,
         routed_scenario=routed_scenario,
         answer_strategy=answer_strategy,
+        llm_debug_refs=list(llm_debug_refs or []),
     )
 
 

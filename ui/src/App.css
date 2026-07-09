@@ -532,6 +532,13 @@ body {
   background: var(--bg);
   border-radius: var(--radius);
   padding: 8px 10px;
+  line-height: 1.6;
+}
+
+.import-meta {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
 }
 
 .fact-form-grid {

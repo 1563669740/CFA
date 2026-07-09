@@ -258,6 +258,7 @@ def _resolve_model_output(assets, public_knowledge_rules, policy, user_input: st
                 "fact_pool": assets,
                 "public_knowledge": public_knowledge_rules,
                 "policy": policy,
+                "allow_fact_pool_to_llm": True,
             },
         )
     raise RuntimeError("无法确定模型回答：请设置 MODEL_OUTPUT_TEXT、MODEL_OUTPUT_PATH 或 USE_DEEPSEEK=True")

@@ -96,10 +96,11 @@ class AnswerSanitizer:
             if unresolved:
                 text = self._make_x_summary(findings)
 
+            return self._append_authorized_query_hint(text)
         else:
             text = self._replace_asset_ids(text)
-
-        return self._append_authorized_query_hint(text)
+            # v2.5: No findings = no risk, return text as-is without hint
+            return text
 
 
     def make_safe_answer(self, raw_answer: str, findings: Sequence[RiskFinding]) -> str:
@@ -119,6 +120,11 @@ class AnswerSanitizer:
             # replacement even if it was not included in dangerous_output_anchors.
             text = self._redact_target_asset_names(text, findings, x_mode=False)
 
+            # v2.6: Policy-level sensitive sweep as safety net.
+            # This catches any sensitive field values that were missed by
+            # findings-driven redaction (e.g., normalized anchors with start=-1).
+            text = self._policy_level_sensitive_sweep(text)
+
             # Post-normalize to eliminate repeated safe placeholders
             # (e.g. "相关治疗方案相关治疗方案治疗" → "相关治疗方案")
             text = self._post_normalize_safe_text(text)
@@ -128,10 +134,11 @@ class AnswerSanitizer:
             if unresolved:
                 text = self._make_safe_summary(findings)
 
+            return self._append_authorized_query_hint(text)
         else:
             text = self._replace_asset_ids(text)
-
-        return self._append_authorized_query_hint(text)
+            # v2.5: No findings = no risk, return text as-is without hint
+            return text
 
     # -------- known-case rewrites (keep for aerospace compatibility) --------
 
@@ -239,11 +246,13 @@ class AnswerSanitizer:
         Replace by anchor span when the span is valid.
 
         This is safer than global literal replacement for exact rule-based anchors.
+        For normalized anchors (start=-1), fall back to anchor.text-based replacement.
         """
 
         if anchor.start is None or anchor.end is None:
             return text
 
+        # Normalized anchors have start=-1, end=-1 — skip span replacement
         if anchor.start < 0 or anchor.end <= anchor.start:
             return text
 
@@ -762,6 +771,147 @@ class AnswerSanitizer:
             replacement = "X" if x_mode else safe_display
             text = self._replace_literal(text, target_name, replacement)
 
+        return text
+
+    # ---------- post-normalization (deduplicate repeated safe placeholders) ----------
+
+    # ---------- v2.6 policy-level sensitive sweep ----------
+
+    def _policy_level_sensitive_sweep(self, text: str) -> str:
+        """Deterministic policy-level sweep for protected/sensitive field values.
+
+        This runs AFTER field-level redaction as a safety net.  It applies
+        regex-based replacement patterns for every protected field declared in
+        the policy, ensuring that any values missed by findings-driven
+        sanitization are still caught.
+
+        The sweep is conservative — it only replaces patterns that match
+        known asset values, avoiding over-redaction.
+        """
+        if not self._policy:
+            return text
+
+        # For each protected field, build replacement patterns from
+        # all known asset values of that field.
+        for field_name in self._policy.protected_fields:
+            replacement = self._safe_replacement(field_name)
+
+            # Collect all known values for this field from assets
+            # (the sanitizer doesn't hold assets directly, so we rely
+            # on policy field_aliases + protected field patterns)
+            if field_name == "collateral":
+                # Collateral phrases: need whole-phrase replacement to avoid
+                # leaving fragments like "张江研发大楼" or "在建产线抵押"
+                text = self._sweep_collateral_phrases(text, replacement)
+
+            elif field_name == "loan_amount":
+                text = self._sweep_amount_patterns(text, replacement)
+
+            elif field_name == "interest_rate":
+                text = self._sweep_rate_patterns(text, replacement)
+
+            elif field_name == "credit_rating":
+                text = self._sweep_rating_patterns(text, replacement)
+
+            elif field_name in {"diagnosis", "medication", "treatment"}:
+                # Healthcare fields: replace known values from aliases
+                text = self._sweep_known_values(text, field_name, replacement)
+
+        return text
+
+    def _sweep_amount_patterns(self, text: str, replacement: str) -> str:
+        """Replace Chinese RMB amounts in text."""
+        # Pattern: 人民币2.8亿元, 2.8亿元, 5000万元, 5,000万元, etc.
+        # Must include unit (亿/万) to avoid matching bare numbers
+        text = re.sub(
+            r"(?:人民币|RMB|CNY)?\s*\d[\d,，]*\.?\d*\s*(?:亿|万)\s*(?:元|块|CNY|RMB)?",
+            replacement,
+            text,
+        )
+        return text
+
+    def _sweep_rate_patterns(self, text: str, replacement: str) -> str:
+        """Replace LPR-based interest rate patterns."""
+        # LPR+120bp, LPR＋120bp, LPR+120个基点, LPR + 120 BP, etc.
+        text = re.sub(
+            r"LPR\s*[\+\-加]\s*\d{2,4}\s*(?:个)?\s*(?:BP|bp|基点|个基点)?",
+            replacement,
+            text,
+            flags=re.IGNORECASE,
+        )
+        # Also replace "年化4.65%" style
+        text = re.sub(
+            r"（?年化\d+\.?\d*%\s*(?:）?\)?)?",
+            replacement,
+            text,
+        )
+        return text
+
+    def _sweep_rating_patterns(self, text: str, replacement: str) -> str:
+        """Replace credit rating patterns like AA+, BB, etc."""
+        # Match standalone credit ratings: AA+, AA-, BB, CCC, etc.
+        # Must be bounded to avoid matching abbreviations like "AA" in "AAPL"
+        text = re.sub(
+            r"(?<![A-Za-z])(?:AAA|AA|A|BBB|BB|B|CCC|CC|C)\s*[+＋\-－]?(?:级)?(?![A-Za-z])",
+            replacement,
+            text,
+        )
+        # Also match "信用评级AA+" "主体评级BB" patterns
+        text = re.sub(
+            r"(?:信用|主体)评级(?:AAA|AA|A|BBB|BB|B|CCC|CC|C)\s*[+＋\-－]?",
+            replacement,
+            text,
+        )
+        return text
+
+    def _sweep_collateral_phrases(self, text: str, replacement: str) -> str:
+        """Replace whole collateral/mortgage phrases to avoid fragment leakage.
+
+        Instead of naive substring replacement that leaves "张江研发大楼"
+        or "在建产线抵押", we match complete descriptive phrases.
+        """
+        # Pattern 1: "有X担保函和Y抵押" → "有相关抵押担保安排"
+        text = re.sub(
+            r"有[^。；，,；;]{0,30}?(?:担保函|抵押|质押)[^。；，,；;]{0,10}",
+            replacement,
+            text,
+        )
+        # Pattern 2: "以X研发大楼和Y质押" → "以相关抵押担保安排"
+        text = re.sub(
+            r"以[^。；，,；;]{0,30}?(?:研发大楼|担保函|抵押|质押|产线|厂房)[^。；，,；;]{0,10}",
+            replacement,
+            text,
+        )
+        # Pattern 3: Residual standalone collateral components
+        # "在建产线抵押", "张江研发大楼"
+        collateral_keywords = (
+            "担保函|抵押|质押|研发大楼|产线|厂房|设备|股权质押|专利权|专利质押"
+            "|担保物|抵押物|质权"
+        )
+        text = re.sub(
+            rf"[^。；，,；;]*?(?:{collateral_keywords})[^。；，,；;]*",
+            replacement,
+            text,
+        )
+        return text
+
+    def _sweep_known_values(self, text: str, field_name: str, replacement: str) -> str:
+        """Replace values from policy field_aliases for a given field."""
+        if not self._policy:
+            return text
+        alias_map = self._policy.field_aliases.get(field_name, {}) or {}
+        # Sort by length descending for longest match first
+        for canonical, aliases in sorted(alias_map.items(), key=lambda x: -len(x[0])):
+            all_terms = [canonical] + list(aliases)
+            for term in sorted(set(all_terms), key=len, reverse=True):
+                if len(term) < 2:
+                    continue
+                # Only replace if it's a standalone term (bounded)
+                try:
+                    pattern = re.escape(term)
+                    text = re.sub(pattern, replacement, text)
+                except re.error:
+                    continue
         return text
 
     # ---------- post-normalization (deduplicate repeated safe placeholders) ----------

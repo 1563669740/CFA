@@ -1,7 +1,23 @@
 ﻿from __future__ import annotations
 
 from dataclasses import dataclass, asdict, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
+
+# ---------------------------------------------------------------------------
+# Normalization result for a field value
+# ---------------------------------------------------------------------------
+
+@dataclass
+class NormalizedValue:
+    """Result of normalizing a text fragment for a given field."""
+    field_name: str
+    raw_text: str
+    canonical_value: str
+    match_type: str                      # exact / alias / normalized / semantic
+    confidence: float = 1.0
+    protected: bool = False
+    evidence: str = ""
+    accepted_values: List[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -308,6 +324,27 @@ class Anchor:
         if self.match_type in ("exact", "alias"):
             return "="
         return "≈"
+
+
+# ---------------------------------------------------------------------------
+# v2.5 — DisclosureClaim for multi-claim CFA detection
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DisclosureClaim:
+    """One local disclosure claim split from the model output.
+
+    Each claim independently participates in candidate binding, risk
+    detection, and sanitization.  Claims are UNION-ed, not AND-ed.
+    """
+    claim_id: str
+    text: str
+    start: int
+    end: int
+    context_anchors: List[Anchor] = field(default_factory=list)
+    local_output_anchors: List[Anchor] = field(default_factory=list)
+    candidate_assets: List[AssetFact] = field(default_factory=list)
+    candidate_asset_ids: List[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

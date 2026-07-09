@@ -10,16 +10,19 @@ from .anchor_verifier import AnchorVerifier
 from .deepseek import DeepSeekClient
 from .extractor import RuleBasedAnchorExtractor
 from .llm_extractor import LLMSemanticAnchorExtractor
+from .claim_builder import ClaimBuilder
 from .models import (
     AnalysisResult,
     Anchor,
     AssetFact,
     CandidateSnapshot,
+    DisclosureClaim,
     FieldPolicy,
     ReductionStep,
     RestorationDecision,
     RiskFinding,
 )
+from .normalizers import FieldNormalizer
 from .sanitizer import AnswerSanitizer
 from .semantic_index import SemanticIndex
 
@@ -514,8 +517,26 @@ class CFAScoreEngine:
         input_count = len(snapshot.input_candidates)
         final_count = len(snapshot.final_candidates)
 
-        # 0 candidates = inconsistent evidence, not restoration
+        # 0 candidates = inconsistent evidence, OR multi-record conflict
         if final_count == 0:
+            # v2.5: Check if 0 is due to multi-record conflict (multiple values of same field)
+            # If so, still report as potentially dangerous (direct disclosure may apply)
+            output_field_values: Dict[str, set[str]] = {}
+            for a in snapshot.output_anchors:
+                if not a.inferred:
+                    output_field_values.setdefault(a.field_name, set()).add(
+                        a.canonical_value or a.text
+                    )
+            has_conflict = any(len(v) >= 2 for v in output_field_values.values())
+            if has_conflict and any(a.protected for a in snapshot.output_anchors):
+                return RestorationDecision(
+                    detected=True,
+                    trigger_type="direct_protected_disclosure",
+                    restored_fields=sorted({
+                        a.field_name for a in snapshot.output_anchors if a.protected
+                    }),
+                    reason="模型输出包含多记录冲突且直接泄露受限字段。",
+                )
             return RestorationDecision(
                 detected=False,
                 trigger_type="inconsistent_evidence",
@@ -1121,6 +1142,7 @@ class CFAScoreEngine:
         - Always run rule-based extraction on BOTH user_input and model_output.
         - LLM extraction is optional.
         - If LLM extraction fails, fall back to rule anchors, not empty anchors.
+        - v2.5: Also runs normalized extraction for fuzzy-matched amounts, rates, ratings.
         - This helper must be used by both the first pass and the secondary pass.
         """
 
@@ -1178,7 +1200,435 @@ class CFAScoreEngine:
                 # LLM extraction failure must not remove rule-based input anchors.
                 llm_anchors = []
 
-        return AnchorMerger.merge(rule_anchors, llm_anchors)
+        merged = AnchorMerger.merge(rule_anchors, llm_anchors)
+
+        # 3. v2.5: Normalized anchors for fuzzy-matched amounts, rates, ratings, collateral
+        normalized_anchors = self._extract_normalized_anchors(user_input, model_output)
+        # Merge normalized anchors with existing (avoid duplicates by span)
+        all_anchors = self._merge_normalized_anchors(merged, normalized_anchors)
+
+        return all_anchors
+
+    def _extract_normalized_anchors(
+        self,
+        user_input: str,
+        model_output: str,
+    ) -> List[Anchor]:
+        """Extract anchors via field normalizers (amount, rate, rating, collateral components)."""
+        normalizer = FieldNormalizer(self.policy, self.assets)
+
+        anchors: List[Anchor] = []
+        anchor_index = 0
+
+        for source, text in [("input", user_input), ("output", model_output)]:
+            if not text or not text.strip():
+                continue
+
+            # 1. Amount/rate/rating/date normalization
+            for nv in normalizer.extract_normalized_anchors(text, source=source):
+                anchor = self._normalized_value_to_anchor(nv, text, source, anchor_index)
+                anchor_index += 1
+                anchors.append(anchor)
+
+            # 2. Collateral component matching
+            if "collateral" in self.policy.field_order:
+                for nv in normalizer.match_collateral_components(text, "collateral"):
+                    anchor = self._normalized_value_to_anchor(nv, text, source, anchor_index)
+                    anchor_index += 1
+                    anchors.append(anchor)
+
+        return anchors
+
+    def _normalized_value_to_anchor(
+        self,
+        nv,
+        text: str,
+        source: str,
+        idx: int,
+    ) -> Anchor:
+        """Convert a NormalizedValue to an Anchor."""
+        import hashlib
+        raw_id = f"NV|{source}|{nv.field_name}|{nv.raw_text}|{idx}"
+        digest = hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:10].upper()
+        return Anchor(
+            id=f"N{digest}",
+            field_name=nv.field_name,
+            field_label=self.policy.label(nv.field_name),
+            text=nv.raw_text,
+            canonical_value=nv.canonical_value,
+            start=-1,
+            end=-1,
+            anchor_type="事实锚点",
+            protected=nv.protected,
+            inferred=False,
+            evidence=nv.evidence,
+            source=source,
+            match_type=nv.match_type,
+            confidence=nv.confidence,
+        )
+
+    def _merge_normalized_anchors(
+        self,
+        merged_anchors: List[Anchor],
+        normalized_anchors: List[Anchor],
+    ) -> List[Anchor]:
+        """Merge normalized anchors, avoiding exact duplicate field+value pairs."""
+        if not normalized_anchors:
+            return merged_anchors
+
+        # Build set of existing (source, field, value) keys
+        existing: set[tuple] = set()
+        for a in merged_anchors:
+            key = (a.source, a.field_name, a.canonical_value)
+            existing.add(key)
+
+        result = list(merged_anchors)
+        for na in normalized_anchors:
+            key = (na.source, na.field_name, na.canonical_value)
+            if key in existing:
+                continue
+            existing.add(key)
+            result.append(na)
+
+        # Sort by source, position, field
+        result.sort(
+            key=lambda a: (
+                0 if a.source == "input" else 1,
+                max(0, a.start),
+                a.field_name,
+            )
+        )
+        return result
+
+    # ==================================================================
+    # v2.5 — Claim-level detection (multi-claim architecture)
+    # ==================================================================
+
+    def _has_multi_record_conflict(
+        self,
+        output_anchors: list[Anchor],
+    ) -> bool:
+        """Check if output contains multiple distinct records (discriminator field conflicts)."""
+        field_values: Dict[str, set[str]] = {}
+        discriminator_fields = {
+            "loan_type", "loan_amount", "interest_rate", "collateral",
+            "diagnosis", "medication", "treatment", "meeting_time",
+            "meeting_title", "participant", "asset_type", "asset_value",
+        }
+        for anchor in output_anchors:
+            if anchor.inferred:
+                continue
+            # Check all fields for multi-value conflicts (not just discriminators)
+            field_values.setdefault(anchor.field_name, set()).add(
+                anchor.canonical_value or anchor.text
+            )
+        for field_name, values in field_values.items():
+            if len(values) >= 2:
+                return True
+        return False
+
+    def _build_claim_based_findings(
+        self,
+        anchors: Sequence[Anchor],
+        user_input: str,
+        model_output: str,
+    ) -> List[RiskFinding]:
+        """v2.5: Build findings per disclosure claim, then UNION them.
+
+        This replaces the global AND-based detection for multi-record answers.
+        Each claim independently binds candidates and detects risk.
+        Findings from different claims are unioned, not intersected.
+        """
+        all_anchors = list(anchors)
+        anchor_by_id = {a.id: a for a in all_anchors}
+        input_anchors = [a for a in all_anchors if a.source == "input" and not a.inferred]
+        output_anchors = [a for a in all_anchors if a.source == "output" and not a.inferred]
+
+        # Phase 1: Build claims using ClaimBuilder
+        claim_builder = ClaimBuilder(self.policy, self.assets)
+        claims = claim_builder.build_claims(
+            model_output=model_output,
+            anchors=all_anchors,
+            user_input=user_input,
+        )
+
+        if not claims:
+            # Fallback: treat the entire output as a single claim
+            claims = [
+                DisclosureClaim(
+                    claim_id="CL_GLOBAL",
+                    text=model_output,
+                    start=0,
+                    end=len(model_output),
+                    context_anchors=list(input_anchors),
+                    local_output_anchors=list(output_anchors),
+                    candidate_assets=list(self.assets),
+                    candidate_asset_ids=[a.id for a in self.assets],
+                )
+            ]
+
+        # Phase 2: Detect risk per claim and union findings
+        all_findings: List[RiskFinding] = []
+        seen_finding_keys: set[tuple] = set()
+
+        for claim in claims:
+            claim_findings = self._detect_claim_risk(claim, anchor_by_id)
+            for finding in claim_findings:
+                # Deduplicate across claims
+                # v2.6: For direct_protected_disclosure, the dedup key must include
+                # the specific anchor field_name and value, otherwise all protected
+                # fields within one claim collapse to a single finding (only the
+                # first one survives).  For other finding types the original key
+                # (type + target_ids + restored_fields) is still correct.
+                if finding.finding_type == "direct_protected_disclosure":
+                    # Include first anchor's field+value to differentiate
+                    first_anchor = finding.anchors[0] if finding.anchors else None
+                    anchor_sig = (
+                        first_anchor.field_name,
+                        first_anchor.effective_canonical_value(),
+                    ) if first_anchor else ("unknown", str(finding.target_asset_ids))
+                    key = (
+                        finding.finding_type,
+                        anchor_sig,
+                    )
+                else:
+                    key = (
+                        finding.finding_type,
+                        str(finding.target_asset_ids),
+                        str(finding.restored_fields),
+                    )
+                if key in seen_finding_keys:
+                    continue
+                seen_finding_keys.add(key)
+                all_findings.append(finding)
+
+        # Sort by score descending
+        all_findings.sort(
+            key=lambda f: (f.score, len(f.key_anchor_ids), len(f.anchors)),
+            reverse=True,
+        )
+        return all_findings
+
+    def _detect_claim_risk(
+        self,
+        claim: DisclosureClaim,
+        anchor_by_id: Dict[str, Anchor],
+    ) -> List[RiskFinding]:
+        """Detect CFA risk for a single disclosure claim.
+
+        Risk priority:
+        1. Direct protected disclosure in output
+        2. Indirect asset restoration (candidate narrowed to ≤k)
+        3. Indirect protected value restoration
+        4. Protected field convergence without unique match
+        """
+        findings: List[RiskFinding] = []
+
+        # Priority 1: Direct protected disclosure — does NOT require unique binding
+        protected_output = [
+            a for a in claim.local_output_anchors
+            if a.protected and not a.inferred
+        ]
+        if protected_output:
+            # Direct disclosure: findings per protected anchor
+            for anchor in protected_output:
+                score = self._score_direct_disclosure(anchor)
+                level = self._risk_level(score)
+                if level == "LOW":
+                    continue
+
+                # Try to bind to a candidate asset if possible
+                target_asset = None
+                if claim.candidate_assets:
+                    # Find assets where this field matches
+                    for asset in claim.candidate_assets:
+                        if asset.get(anchor.field_name) in self._anchor_values(anchor):
+                            target_asset = asset
+                            break
+
+                asset_id = target_asset.id if target_asset else "unknown"
+                asset_name = (
+                    target_asset.display_name(self.policy.display_field)
+                    if target_asset
+                    else f"直接泄露:{anchor.field_label}={anchor.effective_canonical_value()}"
+                )
+                protected_field_names = sorted(
+                    {a.field_name for a in protected_output}
+                )
+                target_ids = [a.id for a in claim.candidate_assets] if claim.candidate_assets else []
+                if target_asset:
+                    target_ids = [target_asset.id]
+
+                findings.append(
+                    RiskFinding(
+                        target_asset_id=asset_id,
+                        target_asset_name=asset_name,
+                        risk_level=level,
+                        score=score,
+                        reason=f"模型输出直接包含受限字段: {anchor.field_label}={anchor.effective_canonical_value()}",
+                        restored_fact=f"{anchor.field_label}={anchor.effective_canonical_value()}",
+                        anchors=[anchor],
+                        reduction_chain=[],
+                        minimal_combinations=[[anchor.id]],
+                        key_anchor_ids=[anchor.id],
+                        key_anchor_summary=[f"模型输出/{anchor.field_label}:{anchor.effective_canonical_value()}"],
+                        finding_type="direct_protected_disclosure",
+                        target_asset_ids=target_ids,
+                        restored_fields=protected_field_names,
+                        input_candidate_count=len(self.assets),
+                        final_candidate_count=len(claim.candidate_assets),
+                        information_gain_bits=0.0,
+                    )
+                )
+            if findings:
+                return findings
+
+        # Priority 2-4: Indirect restoration via candidate binding
+        if not claim.candidate_assets:
+            return findings
+
+        input_candidates = self._filter_candidates_by_context_anchors(
+            claim.context_anchors,
+            anchor_by_id,
+        )
+        final_candidates = claim.candidate_assets
+
+        input_count = len(input_candidates) if input_candidates else len(self.assets)
+        final_count = len(final_candidates)
+
+        if final_count == 0:
+            return findings
+
+        if final_count >= input_count:
+            return findings
+
+        # Information gain
+        if input_count > 0 and final_count > 0:
+            ig = math.log2(input_count / final_count)
+        else:
+            ig = 0.0
+
+        # Priority 2: Indirect asset restoration
+        if (
+            final_count <= self.policy.uniqueness_k
+            and (input_count - final_count) >= self.policy.min_candidate_reduction
+            and ig >= self.policy.min_information_gain_bits
+        ):
+            # Build findings for each narrowed asset
+            snapshot = CandidateSnapshot(
+                input_candidates=input_candidates or list(self.assets),
+                final_candidates=final_candidates,
+                input_anchors=list(claim.context_anchors),
+                output_anchors=list(claim.local_output_anchors),
+                contributing_output_anchors=list(claim.local_output_anchors),
+                information_gain_bits=ig,
+            )
+            decision = RestorationDecision(
+                detected=True,
+                trigger_type="indirect_asset_restoration",
+                restored_fields=list(self.policy.protected_fields),
+                reason=f"模型输出新增线索将候选从 {input_count} 条压缩至 {final_count} 条，信息增益为 {ig:.2f} bit。",
+            )
+
+            for asset in final_candidates:
+                matching = self._anchors_matching_asset(
+                    asset, claim.local_output_anchors, anchor_by_id
+                )
+                chain = self._reduction_chain(matching, anchor_by_id)
+                score = self._score_restoration(snapshot, decision)
+                level = self._risk_level(score)
+                if level == "LOW":
+                    continue
+                findings.append(
+                    RiskFinding(
+                        target_asset_id=asset.id,
+                        target_asset_name=asset.display_name(self.policy.display_field),
+                        risk_level=level,
+                        score=score,
+                        reason=decision.reason,
+                        restored_fact=self._restored_fact(asset, matching),
+                        anchors=matching,
+                        reduction_chain=chain,
+                        minimal_combinations=[[a.id for a in claim.local_output_anchors]],
+                        key_anchor_ids=[a.id for a in claim.local_output_anchors],
+                        key_anchor_summary=self._summarize_key_anchors(claim.local_output_anchors),
+                        finding_type=decision.trigger_type,
+                        target_asset_ids=[a.id for a in final_candidates],
+                        restored_fields=decision.restored_fields,
+                        input_candidate_count=input_count,
+                        final_candidate_count=final_count,
+                        information_gain_bits=ig,
+                    )
+                )
+            return findings
+
+        # Priority 3-4: Protected field convergence
+        before_set = input_candidates or list(self.assets)
+        restored_fields = self._find_restored_protected_fields(before_set, final_candidates)
+        if restored_fields:
+            for asset in final_candidates:
+                matching = self._anchors_matching_asset(
+                    asset, claim.local_output_anchors, anchor_by_id
+                )
+                chain = self._reduction_chain(matching, anchor_by_id)
+                snapshot = CandidateSnapshot(
+                    input_candidates=before_set,
+                    final_candidates=final_candidates,
+                    input_anchors=list(claim.context_anchors),
+                    output_anchors=list(claim.local_output_anchors),
+                    contributing_output_anchors=list(claim.local_output_anchors),
+                    information_gain_bits=ig,
+                )
+                decision = RestorationDecision(
+                    detected=True,
+                    trigger_type="indirect_protected_value_restoration",
+                    restored_fields=restored_fields,
+                    reason="模型输出使部分受限字段收敛到安全阈值以内。",
+                )
+                score = self._score_restoration(snapshot, decision)
+                level = self._risk_level(score)
+                if level == "LOW":
+                    continue
+                findings.append(
+                    RiskFinding(
+                        target_asset_id=asset.id,
+                        target_asset_name=asset.display_name(self.policy.display_field),
+                        risk_level=level,
+                        score=score,
+                        reason=decision.reason,
+                        restored_fact=self._restored_fact(asset, matching),
+                        anchors=matching,
+                        reduction_chain=chain,
+                        minimal_combinations=[[a.id for a in claim.local_output_anchors]],
+                        key_anchor_ids=[a.id for a in claim.local_output_anchors],
+                        key_anchor_summary=self._summarize_key_anchors(claim.local_output_anchors),
+                        finding_type=decision.trigger_type,
+                        target_asset_ids=[a.id for a in final_candidates],
+                        restored_fields=decision.restored_fields,
+                        input_candidate_count=input_count,
+                        final_candidate_count=final_count,
+                        information_gain_bits=ig,
+                    )
+                )
+            return findings
+
+        return findings
+
+    def _filter_candidates_by_context_anchors(
+        self,
+        context_anchors: list[Anchor],
+        anchor_by_id: Dict[str, Anchor],
+    ) -> list[AssetFact]:
+        """Filter all assets by context anchors (from user input)."""
+        if not context_anchors:
+            return list(self.assets)
+        return self._filter_candidates(list(self.assets), context_anchors, anchor_by_id)
+
+    def _score_direct_disclosure(self, anchor: Anchor) -> float:
+        """Score for direct protected disclosure."""
+        base = 60.0
+        confidence = anchor.confidence * self.policy.match_type_weight(anchor.match_type)
+        return round(min(100.0, base + 20.0 * confidence + 20.0 * min(1.0, len(anchor.text) / 50.0)), 2)
 
     # ==================================================================
     # Main analyze entry point
@@ -1199,12 +1649,29 @@ class CFAScoreEngine:
             model_output=model_output,
         )
 
-        # Step 4: Build findings (v2.3 snapshot-based)
-        findings = self._build_findings(all_anchors)
+        # Step 4: Build findings
+        # v2.5: Route to claim-based detection when multi-record conflicts exist
+        output_anchors = [a for a in all_anchors if a.source == "output" and not a.inferred]
+        if self._has_multi_record_conflict(output_anchors):
+            findings = self._build_claim_based_findings(
+                all_anchors,
+                user_input=user_input,
+                model_output=model_output,
+            )
+        else:
+            findings = self._build_findings(all_anchors)
 
         # Step 5: Sanitize
         x_replaced = self.sanitizer.make_x_replaced(model_output, findings)
         safe = self.sanitizer.make_safe_answer(model_output, findings)
+
+        # v2.6: Redact company_name / display_field when model adds it
+        # but user input does not contain it (new-info sensitive field leak).
+        safe = self._redact_new_sensitive_display_field(safe, user_input, model_output)
+
+        # v2.6: Post-sanitize re-check: re-extract anchors from the safe answer
+        # to verify no protected field values remain.
+        safe = self._post_sanitize_recheck(safe, user_input)
 
         # Step 6: Secondary check (Mode 3)
         secondary_performed = False
@@ -1257,6 +1724,94 @@ class CFAScoreEngine:
     # ==================================================================
     # LLM Safe Rewrite (Mode 3)
     # ==================================================================
+
+    # ==================================================================
+    # v2.6 — Display field redaction (new sensitive identifier leak)
+    # ==================================================================
+
+    def _redact_new_sensitive_display_field(
+        self,
+        safe: str,
+        user_input: str,
+        raw_answer: str,
+    ) -> str:
+        """Redact display_field values when model adds them without user input.
+
+        For example: user asks about "半导体行业的公司" and model outputs
+        "星辰科技股份有限公司" — this is a new sensitive identifier leak
+        that must be redacted even if not captured by findings.
+        """
+        if not self.policy.display_field:
+            return safe
+        sensitive_fields = self.policy.sensitive_fields or []
+        if self.policy.display_field not in sensitive_fields:
+            return safe
+
+        replacement = self.sanitizer._safe_replacement(self.policy.display_field)
+
+        for asset in self.assets:
+            display_value = asset.get(self.policy.display_field)
+            if not display_value or len(display_value) < 2:
+                continue
+            # If user input already contains this value, it's not a new-info leak
+            if display_value in user_input:
+                continue
+            # Replace all occurrences in safe answer
+            safe = safe.replace(display_value, replacement)
+
+        return safe
+
+    # ==================================================================
+    # v2.6 — Post-sanitize re-check
+    # ==================================================================
+
+    def _post_sanitize_recheck(self, safe: str, user_input: str) -> str:
+        """Re-extract anchors from the safe answer to verify no residual leaks.
+
+        If any protected output anchors remain, apply a second pass of
+        policy-level sensitive sweep to catch them.  If the sweep still
+        doesn't eliminate all residual risk, return a fixed safe summary.
+        """
+        # Re-extract anchors from the safe answer
+        residual_anchors = self._extract_anchors_for_pass(
+            user_input=user_input,
+            model_output=safe,
+        )
+
+        # Count protected output anchors
+        residual_protected = [
+            a for a in residual_anchors
+            if a.source == "output" and a.protected and not a.inferred
+        ]
+
+        if not residual_protected:
+            return safe
+
+        # Apply another round of policy-level sweep as safety net
+        safe = self.sanitizer._policy_level_sensitive_sweep(safe)
+
+        # Re-check again after sweep
+        residual_anchors2 = self._extract_anchors_for_pass(
+            user_input=user_input,
+            model_output=safe,
+        )
+        residual_protected2 = [
+            a for a in residual_anchors2
+            if a.source == "output" and a.protected and not a.inferred
+        ]
+
+        if not residual_protected2:
+            return safe
+
+        # Still leaking — return deterministic safe summary
+        field_names = sorted({a.field_name for a in residual_protected2})
+        labels = [self.policy.label(fn) for fn in field_names]
+        return (
+            "该回答涉及受限信息（"
+            + "、".join(labels)
+            + "），具体内容已省略。"
+            + self.policy.safe_hint
+        )
 
     def _llm_safe_rewrite(
         self,

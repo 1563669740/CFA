@@ -68,21 +68,24 @@ class GatewayResponse:
     routed_scenario: str = ""   # the scenario that actually handled the request
     answer_strategy: str = ""   # "cfa_gated" | "general_answer" | "weather_answer" | "need_city_prompt"
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
+    def to_dict(self, debug: bool = False) -> Dict[str, Any]:
+        """Serialize to dict.  ``debug=True`` includes raw_answer and findings_summary."""
+        data: Dict[str, Any] = {
             "request_id": self.request_id,
             "answer": self.answer,
-            "raw_answer": self.raw_answer,
             "risk_detected": self.risk_detected,
             "risk_level": self.risk_level,
             "score": self.score,
             "safe_answer_used": self.safe_answer_used,
             "findings_count": self.findings_count,
-            "findings_summary": self.findings_summary,
             "intent": self.intent,
             "routed_scenario": self.routed_scenario,
             "answer_strategy": self.answer_strategy,
         }
+        if debug:
+            data["raw_answer"] = self.raw_answer
+            data["findings_summary"] = self.findings_summary
+        return data
 
 
 # ---------------------------------------------------------------------------
@@ -495,9 +498,12 @@ class CFAGateway:
         """
         system_prompt = get_general_system_prompt(intent_info)
         # Use an empty/dummy policy — no internal data is involved
+        from dataclasses import replace
+        # Use a minimal valid policy — no internal data is involved
         empty_policy = FieldPolicy(
             protected_fields=[],
             identifier_fields=[],
+            quasi_identifier_fields=[],
             field_order=[],
             field_labels={},
             field_weights={},

@@ -221,5 +221,16 @@
   },
   "llm_confidence_threshold": 0.40,
   "llm_max_accepted_values": 30,
-  "llm_extraction_fields": ["loan_amount", "interest_rate", "credit_rating", "collateral"]
+  "llm_extraction_fields": ["loan_amount", "interest_rate", "credit_rating", "collateral"],
+  "direct_block_fields": [
+    "loan_amount",
+    "interest_rate",
+    "credit_rating",
+    "collateral"
+  ],
+  "conditional_redact_fields": [
+    "company_name",
+    "project_name"
+  ],
+  "multi_record_enabled": true
 }

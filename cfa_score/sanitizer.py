@@ -1,7 +1,7 @@
 ﻿from __future__ import annotations
 
 import re
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from .models import Anchor, FieldPolicy, RiskFinding
 
@@ -54,22 +54,49 @@ class AnswerSanitizer:
 
     def make_x_replaced(self, raw_answer: str, findings: Sequence[RiskFinding]) -> str:
         text = raw_answer
+
         if findings:
+            # Pre-processing: known-case rewrite for demo compatibility.
             text = self._rewrite_known_case_for_x(text)
-            for anchor in self._dangerous_output_anchors(findings):
-                text = self._replace_literal(text, anchor.text, "X")
+
+            text, unresolved = self._apply_field_level_redaction(
+                text,
+                findings,
+                x_mode=True,
+            )
+
+            # 如果存在无法定位到原文片段的高风险语义锚点，直接退回 X 摘要。
+            # 这样可以避免"看起来改写了，但语义线索还残留"的情况。
+            if unresolved:
+                text = self._make_x_summary(findings)
+
+        else:
+            text = self._replace_asset_ids(text)
+
         return self._append_authorized_query_hint(text)
+
 
     def make_safe_answer(self, raw_answer: str, findings: Sequence[RiskFinding]) -> str:
         text = raw_answer
+
         if findings:
+            # Pre-processing: known-case rewrite for demo compatibility.
             text = self._rewrite_known_case_for_safe(text)
-            for anchor in self._dangerous_output_anchors(findings):
-                replacement = self._safe_replacement(anchor.field_name)
-                text = self._replace_literal(text, anchor.text, replacement)
+
+            text, unresolved = self._apply_field_level_redaction(
+                text,
+                findings,
+                x_mode=False,
+            )
+
+            # 严格兜底：如果危险锚点是语义抽取出来的，但无法在文本中可靠替换，
+            # 不再放行原回答，而是返回字段级安全摘要。
+            if unresolved:
+                text = self._make_safe_summary(findings)
+
         else:
-            # Even without findings, replace asset IDs that appear in text
             text = self._replace_asset_ids(text)
+
         return self._append_authorized_query_hint(text)
 
     # -------- known-case rewrites (keep for aerospace compatibility) --------
@@ -108,6 +135,472 @@ class AnswerSanitizer:
         text = text.replace("航天测控生产区", "生产区")
         return text
 
+    # ---------- field-level redaction (v2.4) ----------
+
+    def _apply_field_level_redaction(
+        self,
+        text: str,
+        findings: Sequence[RiskFinding],
+        *,
+        x_mode: bool = False,
+    ) -> Tuple[str, bool]:
+        """
+        Apply field-level redaction instead of literal anchor.text replacement only.
+
+        Returns:
+            (redacted_text, unresolved)
+
+        unresolved=True means at least one dangerous output anchor could not be
+        reliably located or rewritten. In that case the caller should fall back to
+        a safe summary.
+        """
+
+        unresolved = False
+
+        for anchor in self._dangerous_output_anchors(findings):
+            replacement = "X" if x_mode else self._safe_replacement(anchor.field_name)
+
+            before = text
+
+            # 1. 优先用 span 替换，适用于规则抽取出的精确锚点。
+            text = self._replace_anchor_span_if_valid(text, anchor, replacement)
+
+            # 2. 再用 anchor.text / canonical / aliases / semantic aliases / versions 替换。
+            text = self._replace_anchor_variants(text, anchor, replacement)
+
+            # 3. 如果还没替换成功，首先确认锚点的危险变体是否仍存在于文本中。
+            if text == before:
+                if self._any_variant_present(text, anchor):
+                    # 尝试句子级兜底。
+                    sentence_redacted = self._replace_sentence_containing_anchor(
+                        text,
+                        anchor,
+                        replacement,
+                    )
+
+                    if sentence_redacted != text:
+                        text = sentence_redacted
+                    else:
+                        unresolved = True
+                elif self._is_semantic_anchor_without_literal_match(text, anchor):
+                    # 语义锚点：检测到危险信号但无法映射到具体文本片段，
+                    # 标记为 unresolved 以便调用方回退到安全摘要。
+                    unresolved = True
+                # 否则：危险变体已被前处理（如 known-case rewrite）移除，该锚点已安全。
+
+        # 无论有没有 findings，都顺手处理裸资产编号。
+        text = self._replace_asset_ids(text)
+
+        return text, unresolved
+
+    # -------- span-based replacement --------
+
+    def _replace_anchor_span_if_valid(
+        self,
+        text: str,
+        anchor: Anchor,
+        replacement: str,
+    ) -> str:
+        """
+        Replace by anchor span when the span is valid.
+
+        This is safer than global literal replacement for exact rule-based anchors.
+        """
+
+        if anchor.start is None or anchor.end is None:
+            return text
+
+        if anchor.start < 0 or anchor.end <= anchor.start:
+            return text
+
+        if anchor.end > len(text):
+            return text
+
+        span_text = text[anchor.start:anchor.end]
+
+        if not span_text.strip():
+            return text
+
+        # 如果 span 与 anchor.text 对不上，不强行替换，避免错位。
+        if anchor.text and span_text != anchor.text:
+            return text
+
+        return text[:anchor.start] + replacement + text[anchor.end:]
+
+    # -------- semantic anchor detection --------
+
+    def _is_semantic_anchor_without_literal_match(
+        self, text: str, anchor: Anchor
+    ) -> bool:
+        """Return True if this anchor carries a dangerous canonical or accepted
+        value that was detected via semantic/LLM extraction but none of its
+        variants literally appear in `text`.  Such anchors can't be rewritten
+        in-place and must trigger a summary fallback.
+
+        Only semantic-origin anchors (match_type or anchor_type == 'semantic')
+        trigger this path.  Rule-based anchors whose dangerous text was already
+        handled by preprocessing are considered safe."""
+
+        # Not a semantic anchor — if variants are gone, preprocessing handled it.
+        if anchor.match_type != "semantic" and anchor.anchor_type != "semantic":
+            return False
+
+        if anchor.start >= 0 and anchor.end > anchor.start:
+            return False
+
+        if self._is_already_safe_placeholder(anchor):
+            return False
+
+        return not self._any_variant_present(text, anchor)
+
+    # -------- variant presence check --------
+
+    def _any_variant_present(self, text: str, anchor: Anchor) -> bool:
+        """Return True if at least one dangerous variant of the anchor still
+        appears in the text.  Used to decide whether unresolved should be set
+        after the primary replacement passes have run."""
+
+        variants = self._variant_terms_for_anchor(anchor)
+
+        if anchor.field_name == "component_version":
+            canonical = anchor.effective_canonical_value()
+            m = re.search(r"\d+(?:\.\d+){1,3}", canonical or "")
+            if m:
+                parts = m.group(0).split(".")
+                if len(parts) >= 2:
+                    variants.append(".".join(parts[:2]))
+
+        variants = [v for v in variants if v]
+        text_lower = text.lower()
+
+        for v in variants:
+            if v.lower() in text_lower:
+                # Also check against safe replacements — they count as "not dangerous"
+                if not self._text_is_safe_value(v, anchor.field_name):
+                    return True
+
+        return False
+
+    # -------- variant-based replacement --------
+
+    def _replace_anchor_variants(
+        self,
+        text: str,
+        anchor: Anchor,
+        replacement: str,
+    ) -> str:
+        """
+        Replace all known textual variants of a dangerous anchor.
+        """
+
+        patterns = self._redaction_patterns_for_anchor(anchor)
+
+        # 长模式优先，避免先把短词替换掉导致长词匹配失败。
+        patterns = sorted(set(patterns), key=len, reverse=True)
+
+        for pattern in patterns:
+            try:
+                text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+            except re.error:
+                continue
+
+        return text
+
+    # -------- pattern generation --------
+
+    def _redaction_patterns_for_anchor(self, anchor: Anchor) -> List[str]:
+        patterns: List[str] = []
+
+        terms = self._variant_terms_for_anchor(anchor)
+
+        for term in terms:
+            term = str(term or "").strip()
+            if not term:
+                continue
+
+            if anchor.field_name == "component_version":
+                patterns.extend(self._version_patterns(term))
+            else:
+                patterns.append(self._literal_pattern(term))
+
+        # 对版本字段额外用 canonical value 生成宽松模式。
+        if anchor.field_name == "component_version":
+            canonical = anchor.effective_canonical_value()
+            patterns.extend(self._version_patterns(canonical))
+
+        return [p for p in patterns if p]
+
+    # -------- variant terms collection --------
+
+    def _variant_terms_for_anchor(self, anchor: Anchor) -> List[str]:
+        """
+        Collect textual variants for one anchor:
+        - original text
+        - canonical value
+        - accepted candidate values
+        - field aliases
+        - semantic aliases
+        """
+
+        terms: List[str] = []
+
+        def add(value: str):
+            value = str(value or "").strip()
+            if value and value not in terms:
+                terms.append(value)
+
+        add(anchor.text)
+        add(anchor.canonical_value)
+
+        for value in anchor.accepted_values or []:
+            add(value)
+
+        if not self._policy:
+            return terms
+
+        field_name = anchor.field_name
+        canonical = anchor.effective_canonical_value()
+
+        # field_aliases: field_name -> canonical_value -> aliases
+        alias_map = self._policy.field_aliases.get(field_name, {}) or {}
+
+        if canonical in alias_map:
+            for alias in alias_map.get(canonical, []):
+                add(alias)
+
+        # 有些配置里 canonical_value 可能为空，用 accepted_values 再查一次。
+        for value in anchor.accepted_values or []:
+            if value in alias_map:
+                for alias in alias_map.get(value, []):
+                    add(alias)
+
+        # semantic_aliases: components / aliases / partial_clues
+        semantic_map = self._policy.get_semantic_aliases(field_name)
+
+        candidate_keys = [canonical] + list(anchor.accepted_values or [])
+
+        for key in candidate_keys:
+            if not key or key not in semantic_map:
+                continue
+
+            semantic = semantic_map[key]
+
+            for item in semantic.aliases:
+                add(item)
+
+            for item in semantic.components:
+                add(item)
+
+            for item in semantic.partial_clues:
+                add(item)
+
+        return terms
+
+    # -------- version fuzzy matching --------
+
+    def _version_patterns(self, term: str) -> List[str]:
+        """
+        Build fuzzy regex patterns for version-like protected values.
+
+        Examples:
+            xz-utils 5.6.1
+            xz utils v5.6.1
+            5.6.1
+            5.6 系列
+            5.6 分支
+        """
+
+        term = str(term or "").strip()
+
+        if not term:
+            return []
+
+        patterns: List[str] = []
+
+        # 原始 literal 仍然保留。
+        patterns.append(self._literal_pattern(term))
+
+        # 抽取版本号：5.6 / 5.6.1 / 1.2.3.4
+        version_match = re.search(r"(?P<ver>\d+(?:\.\d+){1,3})", term)
+
+        if not version_match:
+            return patterns
+
+        version = version_match.group("ver")
+
+        # 产品名部分：版本号前面的文本
+        product_part = term[:version_match.start()].strip(" -_:/，,;；")
+
+        version_re = re.escape(version).replace(r"\.", r"\.")
+
+        # 版本号自身，比如 5.6.1。
+        patterns.append(rf"(?<![A-Za-z0-9_.-])v?\s*{version_re}(?![A-Za-z0-9_.-])")
+
+        # 产品 + 版本，比如 xz-utils 5.6.1 / xz utils v5.6.1。
+        if product_part:
+            product_re = re.escape(product_part)
+            product_re = product_re.replace(r"\-", r"[\s_-]*")
+            product_re = product_re.replace(r"\ ", r"[\s_-]+")
+
+            patterns.append(
+                rf"(?<![A-Za-z0-9_.-]){product_re}\s*[-_:]?\s*v?\s*{version_re}(?![A-Za-z0-9_.-])"
+            )
+
+        # major.minor 系列表达，比如 5.6 系列 / 5.6 分支 / 5.6 小版本。
+        parts = version.split(".")
+
+        if len(parts) >= 2:
+            family = ".".join(parts[:2])
+            family_re = re.escape(family).replace(r"\.", r"\.")
+
+            patterns.append(
+                rf"(?<![A-Za-z0-9_.-]){family_re}\s*(?:系列|分支|版本线|小版本|受影响版本|相关版本)(?![A-Za-z0-9_.-])"
+            )
+
+            patterns.append(
+                rf"(?:{family_re}\s*系列中受影响的小版本|{family_re}\s*分支中的受影响版本)"
+            )
+
+        return patterns
+
+    # -------- sentence-level fallback --------
+
+    def _replace_sentence_containing_anchor(
+        self,
+        text: str,
+        anchor: Anchor,
+        replacement: str,
+    ) -> str:
+        """
+        Sentence-level fallback.
+
+        If exact variant replacement fails, redact the sentence that contains
+        a recognizable variant.
+        """
+
+        variants = self._variant_terms_for_anchor(anchor)
+
+        # 加入 canonical 中的版本 family，帮助定位"5.6 系列"这种句子。
+        if anchor.field_name == "component_version":
+            canonical = anchor.effective_canonical_value()
+            m = re.search(r"\d+(?:\.\d+){1,3}", canonical or "")
+            if m:
+                parts = m.group(0).split(".")
+                if len(parts) >= 2:
+                    variants.append(".".join(parts[:2]))
+
+        variants = [v for v in variants if v]
+
+        if not variants:
+            return text
+
+        # 简单按中文/英文句末切分，保留分隔符。
+        sentence_pattern = re.compile(r"[^。！？!?；;\n]+[。！？!?；;]?", flags=re.MULTILINE)
+
+        def redact_sentence(m: re.Match) -> str:
+            sentence = m.group(0)
+
+            for v in variants:
+                if v and v.lower() in sentence.lower():
+                    return replacement
+
+            return sentence
+
+        return sentence_pattern.sub(redact_sentence, text)
+
+    # -------- safe summary fallbacks --------
+
+    def _make_safe_summary(self, findings: Sequence[RiskFinding]) -> str:
+        """
+        Build a deterministic safe summary when field-level redaction is uncertain.
+        """
+
+        field_names: List[str] = []
+
+        for finding in findings:
+            for field_name in finding.restored_fields or []:
+                if field_name not in field_names:
+                    field_names.append(field_name)
+
+            for anchor in finding.anchors:
+                if anchor.source == "output" and not anchor.inferred:
+                    if anchor.field_name not in field_names:
+                        field_names.append(anchor.field_name)
+
+        labels = []
+
+        for field_name in field_names:
+            if self._policy:
+                labels.append(self._policy.label(field_name))
+            else:
+                labels.append(field_name)
+
+        if labels:
+            field_text = "、".join(labels)
+            return f"该回答涉及可能导致受限事实恢复的字段信息（{field_text}），具体内容已省略。"
+
+        return "该回答涉及可能导致受限事实恢复的信息，具体内容已省略。"
+
+
+    def _make_x_summary(self, findings: Sequence[RiskFinding]) -> str:
+        return "X"
+
+    # -------- safe placeholder detection --------
+
+    def _is_already_safe_placeholder(self, anchor: Anchor) -> bool:
+        """Return True only when *all* available textual representations are
+        already safe placeholders — i.e. this anchor does not carry any
+        dangerous values worth redacting."""
+
+        # Check anchor.text
+        anchor_text = str(anchor.text or "").strip()
+
+        if anchor_text and not self._text_is_safe_value(anchor_text, anchor.field_name):
+            return False
+
+        # Check canonical_value
+        canonical = str(anchor.canonical_value or "").strip()
+        if canonical and not self._text_is_safe_value(canonical, anchor.field_name):
+            return False
+
+        # Check accepted_values
+        for value in anchor.accepted_values or []:
+            value = str(value or "").strip()
+            if value and not self._text_is_safe_value(value, anchor.field_name):
+                return False
+
+        # All populated fields are already safe — skip this anchor.
+        return anchor_text != "" or canonical != ""
+
+    def _text_is_safe_value(self, text: str, field_name: str) -> bool:
+        """Check whether a single text string is a known safe placeholder."""
+        text = str(text or "").strip()
+
+        if not text:
+            return True
+
+        safe_values = {
+            "相关对象",
+            "相关业务域",
+            "相关环境",
+            "相关系统",
+            "受影响版本",
+            "相关风险状态",
+            "相关处置状态",
+            "远程入口",
+            "相关事实",
+            "已省略",
+        }
+
+        if text in safe_values:
+            return True
+
+        if self._policy and self._policy.safe_replacements:
+            if text == self._policy.safe_replacements.get(field_name):
+                return True
+
+        return False
+
     # ---------- dangerous anchors ----------
 
     def _dangerous_output_anchors(self, findings: Sequence[RiskFinding]) -> List[Anchor]:
@@ -133,7 +626,7 @@ class AnswerSanitizer:
             for anchor in finding.anchors:
                 if anchor.source != "output" or anchor.inferred:
                     continue
-                if anchor.text in {"受影响版本", "处置未完成", "回滚完成前"}:
+                if self._is_already_safe_placeholder(anchor):
                     continue
 
                 # Direct sensitive disclosure

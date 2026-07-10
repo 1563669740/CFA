@@ -145,6 +145,31 @@ class RestorationDecision:
 
 
 # ---------------------------------------------------------------------------
+# v2.7 — Audit record for intermediate results
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AuditRecord:
+    """Complete intermediate results for one CFA analysis pass.
+
+    Records all key decision points so the audit trail is self-contained
+    and reproducible.  This replaces implicit scattered logging with an
+    explicit structured record.
+    """
+    input_anchors: List[Dict[str, Any]] = field(default_factory=list)
+    output_anchors: List[Dict[str, Any]] = field(default_factory=list)
+    input_candidate_ids: List[str] = field(default_factory=list)
+    final_candidate_ids: List[str] = field(default_factory=list)
+    input_candidate_count: int = 0
+    final_candidate_count: int = 0
+    restored_fact_ids: List[str] = field(default_factory=list)
+    restored_fields: List[str] = field(default_factory=list)
+    information_gain_bits: float = 0.0
+    trigger_type: str = ""
+    decision_reason: str = ""
+
+
+# ---------------------------------------------------------------------------
 # FieldPolicy (extended with semantic aliases and LLM extraction config).
 # ---------------------------------------------------------------------------
 
@@ -185,6 +210,38 @@ class FieldPolicy:
     llm_confidence_threshold: float = 0.4
     llm_max_accepted_values: int = 30
 
+    # ---- v2.7: Schema-generic slot-fill detection ----
+    # When enabled, the engine looks for I/O slot-restoration patterns
+    # (user asks a slot question, model supplies the value).  The terms
+    # below define what constitutes a slot query / attribute / connector
+    # in the target domain language.
+    slot_detection_enabled: bool = False
+    slot_query_terms: List[str] = field(default_factory=list)
+    slot_attribute_terms: List[str] = field(default_factory=list)
+    slot_connector_terms: List[str] = field(default_factory=list)
+    slot_output_value_pattern: str = ""
+    slot_value_unit_hints: Dict[str, str] = field(default_factory=dict)
+
+    # ---- v2.7: Schema-generic confirmation detection ----
+    # When enabled, the engine checks whether the model confirms/echoes
+    # protected facts already supplied by the user input.
+    confirmation_detection_enabled: bool = False
+    confirmation_terms: List[str] = field(default_factory=list)
+    refusal_terms: List[str] = field(default_factory=list)
+    common_text_fragments: List[str] = field(default_factory=list)
+
+    # ---- v2.7: Schema-generic field sensitivity level ----
+    # Per-field sensitivity: public / protected.  If empty, all
+    # protected_fields are treated as protected.  identifier_fields
+    # are treated as public by default.
+    field_sensitivity: Dict[str, str] = field(default_factory=dict)  # field_name -> "public" | "protected"
+
+    # ---- v2.7: Field data type hints for value normalization ----
+    # e.g. {"loan_amount": "amount", "interest_rate": "rate", "score": "number"}
+    # Used by the extractor to determine how to parse raw text into
+    # canonical values (amount normalization, rate parsing, etc.).
+    field_data_types: Dict[str, str] = field(default_factory=dict)
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "FieldPolicy":
         semantic_raw = data.get("semantic_aliases", {})
@@ -223,6 +280,21 @@ class FieldPolicy:
             llm_extraction_fields=list(data.get("llm_extraction_fields", [])),
             llm_confidence_threshold=float(data.get("llm_confidence_threshold", 0.4)),
             llm_max_accepted_values=int(data.get("llm_max_accepted_values", 30)),
+            # v2.7: Schema-generic slot detection
+            slot_detection_enabled=bool(data.get("slot_detection_enabled", False)),
+            slot_query_terms=list(data.get("slot_query_terms", [])),
+            slot_attribute_terms=list(data.get("slot_attribute_terms", [])),
+            slot_connector_terms=list(data.get("slot_connector_terms", [])),
+            slot_output_value_pattern=str(data.get("slot_output_value_pattern", "")),
+            slot_value_unit_hints=dict(data.get("slot_value_unit_hints", {})),
+            # v2.7: Schema-generic confirmation detection
+            confirmation_detection_enabled=bool(data.get("confirmation_detection_enabled", False)),
+            confirmation_terms=list(data.get("confirmation_terms", [])),
+            refusal_terms=list(data.get("refusal_terms", [])),
+            common_text_fragments=list(data.get("common_text_fragments", [])),
+            # v2.7: Field sensitivity and data types
+            field_sensitivity=dict(data.get("field_sensitivity", {})),
+            field_data_types=dict(data.get("field_data_types", {})),
         )
 
     def label(self, field_name: str) -> str:
@@ -254,6 +326,29 @@ class FieldPolicy:
                 ),
             )
         return result
+
+    def is_field_protected(self, field_name: str) -> bool:
+        """Check whether a field is protected based on field_sensitivity or defaults."""
+        if self.field_sensitivity:
+            sensitivity = self.field_sensitivity.get(field_name, "")
+            if sensitivity == "protected":
+                return True
+            if sensitivity == "public":
+                return False
+        # Fallback: use protected_fields list
+        return field_name in set(self.protected_fields)
+
+    def field_slot_protected_fields(self) -> List[str]:
+        """Return protected fields that can serve as slot-fill targets.
+
+        These are protected fields that are NOT identifier fields
+        (identifier fields are the ones that name the entity, not the
+        sensitive values being protected).  For healthcare this would be
+        diagnosis/medication (not patient_name).  For finance this would
+        be loan_amount/interest_rate (not company_name).
+        """
+        id_set = set(self.identifier_fields)
+        return [f for f in self.protected_fields if f not in id_set]
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +503,9 @@ class AnalysisResult:
     secondary_safe_answer: str = ""
     secondary_findings: List[RiskFinding] = field(default_factory=list)
 
+    # -------- v2.7: Audit trail for intermediate results --------
+    audit: AuditRecord = field(default_factory=AuditRecord)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "user_input": self.user_input,
@@ -420,4 +518,18 @@ class AnalysisResult:
             "secondary_check_performed": self.secondary_check_performed,
             "secondary_safe_answer": self.secondary_safe_answer,
             "secondary_findings": [f.to_dict() for f in self.secondary_findings],
+            # v2.7: Audit trail
+            "audit": {
+                "input_anchors": self.audit.input_anchors,
+                "output_anchors": self.audit.output_anchors,
+                "input_candidate_ids": self.audit.input_candidate_ids,
+                "final_candidate_ids": self.audit.final_candidate_ids,
+                "input_candidate_count": self.audit.input_candidate_count,
+                "final_candidate_count": self.audit.final_candidate_count,
+                "restored_fact_ids": self.audit.restored_fact_ids,
+                "restored_fields": self.audit.restored_fields,
+                "information_gain_bits": self.audit.information_gain_bits,
+                "trigger_type": self.audit.trigger_type,
+                "decision_reason": self.audit.decision_reason,
+            },
         }

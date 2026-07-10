@@ -52,6 +52,7 @@ from .intent_router import (
 )
 from .knowledge import load_assets, load_policy, load_public_knowledge, load_semantic_aliases, merge_public_knowledge
 from .models import AnalysisResult, FieldPolicy, AssetFact, RiskFinding
+from .tracing import create_trace_recorder
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +278,31 @@ class CFAGateway:
             GatewayResponse with CFA-safe answer.
         """
         request_id = _new_request_id()
+        trace = create_trace_recorder(
+            request_id=request_id,
+            base_dir=self._base_dir,
+            metadata={
+                "operation": "handle_chat",
+                "requested_scenario": scenario,
+                "requested_mode": mode,
+                "secondary_enabled": secondary_check,
+            },
+        )
+        trace.snapshot(
+            "request",
+            {
+                "request_id": request_id,
+                "user_input": user_input,
+                "requested_scenario": scenario,
+                "requested_mode": mode,
+                "secondary_enabled": secondary_check,
+                "include_confidential_raw_demo": include_confidential_raw_demo,
+                "include_confidential_cfa_evidence": include_confidential_cfa_evidence,
+            },
+            component="Gateway",
+            stage="gateway.request_received",
+            sensitivity="confidential",
+        )
 
         # ---- Step 0: Intent classification (when scenario is "auto" or "general") ----
         intent_info = classify_intent(user_input)
@@ -289,7 +315,7 @@ class CFAGateway:
                 effective_scenario = map_intent_to_scenario(intent_info)
             else:
                 # Non-domain intent → handle as general chat (no CFA pipeline)
-                return self._handle_general_chat(request_id, user_input, intent_info, mode)
+                return self._handle_general_chat(request_id, user_input, intent_info, mode, trace=trace)
 
         if scenario == "confidential":
             confidential_assets, confidential_policy = self._load_scenario("confidential")
@@ -298,16 +324,37 @@ class CFAGateway:
                 policy=confidential_policy,
             ).classify_and_match(user_input)
             if self._should_route_confidential_to_general(user_input, intent_info, confidential_decision):
-                return self._handle_general_chat(request_id, user_input, intent_info, mode)
+                return self._handle_general_chat(request_id, user_input, intent_info, mode, trace=trace)
             preloaded_resources = (confidential_assets, confidential_policy)
             effective_scenario = "confidential"
 
+        trace.snapshot(
+            "routing",
+            {
+                "intent": intent_info.domain,
+                "requested_scenario": scenario,
+                "effective_scenario": effective_scenario,
+                "requested_mode": mode,
+                "secondary_enabled": secondary_check,
+            },
+            component="Gateway",
+            stage="gateway.routing_decision",
+            sensitivity="internal",
+        )
         # ---- Step 1: Load scenario resources ----
         if preloaded_resources is not None:
             assets, policy = preloaded_resources
         else:
             assets, policy = self._load_scenario(effective_scenario)
 
+        trace.snapshot(
+            "resources",
+            self._build_resource_trace_snapshot(effective_scenario, assets, policy),
+            component="Gateway",
+            stage="gateway.resources_loaded",
+            directory="resources",
+            sensitivity="internal",
+        )
         # ---- Step 2: Call LLM to generate raw_answer with domain boundary ----
         system_prompt = self._build_system_prompt(effective_scenario)
 
@@ -341,7 +388,7 @@ class CFAGateway:
                 assets,
                 policy,
                 inject_fact_pool=True,
-                debug_metadata=debug_ref,
+                debug_metadata={**debug_ref, "call_id": "primary_generation-001", "trace": trace},
             )
             llm_debug_refs = [debug_ref]
 
@@ -354,6 +401,7 @@ class CFAGateway:
             policy=policy,
             mode=mode,
             secondary_check=secondary_check,
+            trace=trace,
         )
 
         # ---- Step 4: Select final safe answer ----
@@ -386,6 +434,30 @@ class CFAGateway:
                 raise ValueError("confidential_raw_demo_mode only supports 'raw' or 'redacted' in public API")
         if effective_scenario == "confidential" and include_confidential_cfa_evidence:
             confidential_cfa_evidence = self._build_confidential_cfa_evidence(result, assets, policy)
+
+        trace.snapshot(
+            "final_result",
+            {
+                "result": result.to_dict(),
+                "final_answer": final_answer,
+                "safe_answer_used": safe_used,
+                "routed_scenario": effective_scenario,
+                "answer_strategy": "cfa_gated",
+            },
+            component="Gateway",
+            stage="gateway.final_result",
+            sensitivity="confidential",
+        )
+        trace.finalize(
+            status="success",
+            summary={
+                "effective_scenario": effective_scenario,
+                "effective_mode": mode,
+                "finding_count": len(result.findings),
+                "risk_level": result.findings[0].risk_level if result.findings else "NONE",
+                "safe_answer_used": safe_used,
+            },
+        )
 
         return _build_response(
             request_id, result, final_answer, safe_used,
@@ -423,10 +495,54 @@ class CFAGateway:
             GatewayResponse with CFA-safe answer.
         """
         request_id = _new_request_id()
+        trace = create_trace_recorder(
+            request_id=request_id,
+            base_dir=self._base_dir,
+            metadata={
+                "operation": "handle_analyze",
+                "requested_scenario": scenario,
+                "requested_mode": mode,
+                "secondary_enabled": secondary_check,
+            },
+        )
+        trace.snapshot(
+            "request",
+            {
+                "request_id": request_id,
+                "user_input": user_input,
+                "model_output": model_output,
+                "requested_scenario": scenario,
+                "requested_mode": mode,
+                "secondary_enabled": secondary_check,
+            },
+            component="Gateway",
+            stage="gateway.request_received",
+            sensitivity="confidential",
+        )
 
         # 1. Load scenario resources
         assets, policy = self._load_scenario(scenario)
 
+        trace.snapshot(
+            "routing",
+            {
+                "requested_scenario": scenario,
+                "effective_scenario": scenario,
+                "requested_mode": mode,
+                "secondary_enabled": secondary_check,
+            },
+            component="Gateway",
+            stage="gateway.routing_decision",
+            sensitivity="internal",
+        )
+        trace.snapshot(
+            "resources",
+            self._build_resource_trace_snapshot(scenario, assets, policy),
+            component="Gateway",
+            stage="gateway.resources_loaded",
+            directory="resources",
+            sensitivity="internal",
+        )
         # 2. Run CFA-Score analysis (no LLM generation step)
         result = self._run_cfa(
             user_input=user_input,
@@ -436,6 +552,7 @@ class CFAGateway:
             policy=policy,
             mode=mode,
             secondary_check=secondary_check,
+            trace=trace,
         )
 
         # 3. Select final safe answer
@@ -456,6 +573,30 @@ class CFAGateway:
         confidential_cfa_evidence = None
         if scenario == "confidential" and include_confidential_cfa_evidence:
             confidential_cfa_evidence = self._build_confidential_cfa_evidence(result, assets, policy)
+
+        trace.snapshot(
+            "final_result",
+            {
+                "result": result.to_dict(),
+                "final_answer": final_answer,
+                "safe_answer_used": safe_used,
+                "routed_scenario": scenario,
+                "answer_strategy": "cfa_gated",
+            },
+            component="Gateway",
+            stage="gateway.final_result",
+            sensitivity="confidential",
+        )
+        trace.finalize(
+            status="success",
+            summary={
+                "effective_scenario": scenario,
+                "effective_mode": mode,
+                "finding_count": len(result.findings),
+                "risk_level": result.findings[0].risk_level if result.findings else "NONE",
+                "safe_answer_used": safe_used,
+            },
+        )
 
         return _build_response(
             request_id,
@@ -509,6 +650,41 @@ class CFAGateway:
         self._scenario_cache[scenario] = {"assets": assets, "policy": policy}
         return assets, policy
 
+    def _build_resource_trace_snapshot(
+        self,
+        scenario: str,
+        assets: List[AssetFact],
+        policy: FieldPolicy,
+    ) -> Dict[str, Any]:
+        preset = _SCENARIO_PRESETS.get(scenario, {})
+        facts_path = self._base_dir / preset.get("facts", "") if preset else None
+        policy_path = self._base_dir / preset.get("policy", "") if preset else None
+        public_knowledge_path = (
+            self._base_dir / preset.get("public_knowledge", "")
+            if preset and preset.get("public_knowledge")
+            else None
+        )
+        semantic_aliases_path = (
+            self._base_dir / preset.get("semantic_aliases", "")
+            if preset and preset.get("semantic_aliases")
+            else None
+        )
+        return {
+            "scenario": scenario,
+            "facts_path": str(facts_path) if facts_path else "",
+            "facts_sha256": _sha256_file(facts_path) if facts_path else "",
+            "policy_path": str(policy_path) if policy_path else "",
+            "policy_sha256": _sha256_file(policy_path) if policy_path else "",
+            "public_knowledge_path": str(public_knowledge_path) if public_knowledge_path else "",
+            "public_knowledge_sha256": _sha256_file(public_knowledge_path) if public_knowledge_path else "",
+            "semantic_aliases_path": str(semantic_aliases_path) if semantic_aliases_path else "",
+            "semantic_aliases_sha256": _sha256_file(semantic_aliases_path) if semantic_aliases_path else "",
+            "asset_count": len(assets),
+            "protected_fields": list(policy.protected_fields),
+            "identifier_fields": list(policy.identifier_fields),
+            "quasi_identifier_fields": list(policy.quasi_identifier_fields),
+            "display_field": policy.display_field,
+        }
     # ------------------------------------------------------------------
     # Internal: LLM call
     # ------------------------------------------------------------------
@@ -558,11 +734,21 @@ class CFAGateway:
         policy: FieldPolicy,
         mode: str,
         secondary_check: bool,
+        trace=None,
     ) -> AnalysisResult:
         """Create engine, run analyze, return result."""
         # P0 安全修复：保密场景禁止 LLM 语义抽取、禁止 LLM 二次改写
         # 候选敏感值（如 secret_content）本身也是保密信息，不能交给 LLM
         if scenario == "confidential":
+            if mode != "rule_only" or secondary_check:
+                trace.fallback(
+                    component="Gateway",
+                    stage="gateway.mode_resolution",
+                    requested_strategy=mode,
+                    effective_strategy="rule_only",
+                    reason_code="confidential_disables_external_llm_cfa",
+                    details={"secondary_check_requested": secondary_check},
+                )
             mode = "rule_only"
             secondary_check = False
         extraction_mode = (
@@ -584,6 +770,7 @@ class CFAGateway:
             policy,
             mode=extraction_mode,
             deepseek_client=deepseek_client,
+            trace=trace,
         )
 
         do_secondary = (
@@ -1020,12 +1207,11 @@ class CFAGateway:
             "请根据用户问题，从目录中选择后续回答需要加载的 content_units。\n"
             f"用户问题：{user_input}\n"
             "输出严格 JSON，格式为："
-            "{\"needs_internal_kb\": true, "
-            "\"content_units_to_load\": [{\"kb_id\": \"...\", \"unit_ids\": [\"...\"]}], "
-            "\"confidence\": 0.0}。"
+            '{"needs_internal_kb": true, '
+            '"content_units_to_load": [{"kb_id": "...", "unit_ids": ["..."]}], '
+            '"confidence": 0.0}。'
             "最多选择 3 条 KB 记录、总计最多 12 个 unit_id；如果没有相关内容，返回空数组。"
         )
-
     def _parse_confidential_kb_selection(
         self,
         text: str,
@@ -1551,6 +1737,7 @@ class CFAGateway:
         user_input: str,
         intent_info,
         mode: str,
+        trace=None,
     ) -> GatewayResponse:
         """Handle a non-domain intent (weather, general chat) without CFA pipeline.
 
@@ -1585,6 +1772,8 @@ class CFAGateway:
                 "secondary_check": False,
                 "inject_fact_pool": False,
                 "safe_knowledge_type": "",
+                "call_id": "primary_generation-001",
+                "trace": trace,
             },
         )
 
@@ -1595,6 +1784,32 @@ class CFAGateway:
             strategy = "weather_answer" if has_city else "need_city_prompt"
         else:
             strategy = "general_answer"
+
+        trace.snapshot(
+            "final_result",
+            {
+                "answer": raw_answer,
+                "risk_detected": False,
+                "risk_level": "NONE",
+                "safe_answer_used": "general_answer",
+                "intent": intent_info.domain,
+                "routed_scenario": "general",
+                "answer_strategy": strategy,
+            },
+            component="Gateway",
+            stage="gateway.final_result",
+            sensitivity="restricted",
+        )
+        trace.finalize(
+            status="success",
+            summary={
+                "effective_scenario": "general",
+                "effective_mode": mode,
+                "risk_level": "NONE",
+                "finding_count": 0,
+                "answer_strategy": strategy,
+            },
+        )
 
         return GatewayResponse(
             request_id=request_id,
@@ -2436,6 +2651,15 @@ def _sha256_text(text: str) -> str:
     return hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()
 
 
+def _sha256_file(path: Path | None) -> str:
+    if path is None or not path.exists() or not path.is_file():
+        return ""
+    hasher = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
 def _normalize_confidential_match_text(text: str) -> str:
     normalized = unicodedata.normalize("NFKC", str(text or "")).lower()
     normalized = re.sub(r"\s+", "", normalized)
@@ -2541,3 +2765,4 @@ def _has_city_name(text: str) -> bool:
         if pattern in text:
             return True
     return False
+

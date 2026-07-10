@@ -128,10 +128,12 @@ class LLMSemanticAnchorExtractor:
         client: DeepSeekClient,
         policy: FieldPolicy,
         semantic_index: SemanticIndex,
+        trace: Any | None = None,
     ):
         self._client = client
         self._policy = policy
         self._index = semantic_index
+        self._trace = trace
         self._anchor_counter = 0
 
     # ------------------------------------------------------------------
@@ -149,43 +151,71 @@ class LLMSemanticAnchorExtractor:
     ) -> List[Anchor]:
         """Extract semantic anchors from a single text segment.
 
-        ``source`` is forced by the caller.  The LLM does not return or
+        ``source`` is forced by the caller. The LLM does not return or
         control the source field.
-
-        Parameters
-        ----------
-        text:
-            The text to analyse (user_input alone, or model_output alone).
-        source:
-            ``"input"`` or ``"output"`` — forced onto every returned Anchor.
-        max_candidates:
-            How many candidates to recall from the semantic index.
         """
         text = text.strip()
 
         if not text:
             return []
 
-        # 1. Independent candidate recall for this segment only
         candidates = self._index.retrieve_candidates(
             text,
             top_k=max_candidates,
         )
 
+        if self._trace is not None:
+            self._trace.snapshot(
+                f"semantic_{source}_retrieval",
+                {
+                    "source": source,
+                    "text": text,
+                    "max_candidates": max_candidates,
+                    "candidates": [
+                        {
+                            "field_name": c.field_name,
+                            "canonical_value": c.canonical_value,
+                            "score": c.score,
+                            "source": c.source,
+                            "matched_terms": list(c.matched_terms),
+                            "score_breakdown": dict(c.score_breakdown),
+                        }
+                        for c in candidates
+                    ],
+                },
+                component="LLMSemanticAnchorExtractor",
+                stage="semantic_extractor.retrieval_completed",
+                directory="retrieval",
+                sensitivity="restricted",
+            )
+
         if not candidates:
             return []
 
-        # 2. Build candidate whitelist (which values this segment is allowed to use)
         candidate_map = self._build_candidate_whitelist(candidates)
 
-        # 3. Build single-segment prompt
+        if self._trace is not None:
+            self._trace.snapshot(
+                f"semantic_{source}_whitelist",
+                {
+                    "source": source,
+                    "candidate_whitelist": {
+                        field: sorted(values)
+                        for field, values in candidate_map.items()
+                    },
+                },
+                component="LLMSemanticAnchorExtractor",
+                stage="semantic_extractor.whitelist_built",
+                directory="retrieval",
+                sensitivity="restricted",
+            )
+
         prompt = self._build_segment_prompt(
             text=text,
             source=source,
             candidates=candidates,
         )
 
-        # 4. Call LLM
         messages = [
             {"role": "system", "content": _SEGMENT_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
@@ -195,25 +225,60 @@ class LLMSemanticAnchorExtractor:
             messages,
             temperature=temperature,
             max_tokens=max_tokens,
+            debug_metadata={
+                "purpose": f"{source}_anchor_extraction",
+                "call_id": f"{source}_anchor_extraction-001",
+                "trace": self._trace,
+            },
         )
 
-        # 5. Parse JSON
+        if self._trace is not None:
+            self._trace.snapshot(
+                f"semantic_{source}_llm_exchange",
+                {
+                    "source": source,
+                    "prompt": prompt,
+                    "messages": messages,
+                    "raw_llm_response": raw_response,
+                },
+                component="LLMSemanticAnchorExtractor",
+                stage="semantic_extractor.llm_response",
+                directory="llm",
+                sensitivity="confidential",
+            )
+
         parsed = self._parse_json_response(raw_response)
+        if self._trace is not None:
+            self._trace.snapshot(
+                f"semantic_{source}_parsed_response",
+                {
+                    "source": source,
+                    "parsed_json": parsed,
+                    "parse_error": None if parsed is not None else "json_parse_failed",
+                },
+                component="LLMSemanticAnchorExtractor",
+                stage="semantic_extractor.response_parsed",
+                directory="llm",
+                sensitivity="restricted",
+            )
         if parsed is None:
             return []
 
-        # 6. Convert to Anchors with source forced + whitelist enforced
-        return self._convert_segment_to_anchors(
+        anchors = self._convert_segment_to_anchors(
             parsed=parsed,
             source=source,
             source_text=text,
             candidate_whitelist=candidate_map,
         )
-
-    # ------------------------------------------------------------------
-    # Public API — legacy dual-text (backward compat)
-    # ------------------------------------------------------------------
-
+        if self._trace is not None:
+            self._trace.snapshot(
+                f"semantic_{source}_anchors_created",
+                [anchor.to_dict() for anchor in anchors],
+                component="LLMSemanticAnchorExtractor",
+                stage="semantic_extractor.anchors_created",
+                sensitivity="restricted",
+            )
+        return anchors
     def extract(
         self,
         user_input: str,
@@ -674,3 +739,4 @@ class LLMSemanticAnchorExtractor:
         ):
             return "状态锚点"
         return "语义锚点"
+

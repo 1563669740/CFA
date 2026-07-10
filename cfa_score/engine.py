@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import hashlib
 import itertools
@@ -7,7 +7,7 @@ import re
 import unicodedata
 from itertools import combinations
 from collections import Counter
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from .anchor_verifier import AnchorVerifier
 from .deepseek import DeepSeekClient
@@ -18,6 +18,7 @@ from .models import (
     AnalysisResult,
     Anchor,
     AssetFact,
+    AuditRecord,
     CandidateSnapshot,
     DisclosureClaim,
     FieldPolicy,
@@ -39,38 +40,52 @@ _FALLBACK_SAFE_ANSWER = (
     "请通过授权系统查询，或联系具备相应权限的人员处理。"
 )
 
-_CONFIRMATION_TERMS = (
+# ---------------------------------------------------------------------------
+# v2.7 — Schema-generic defaults for slot / confirmation detection.
+# These are fallbacks ONLY when the policy does not provide its own terms.
+# ---------------------------------------------------------------------------
+
+_DEFAULT_CONFIRMATION_TERMS = (
     "是", "对", "正确", "确实", "明确", "理解正确", "可以明确", "您的理解是正确",
     "会议决定", "决定", "暂不审议", "后续安排", "等待", "待", "正式上报", "正式报", "上报和审议",
 )
 
-_REFUSAL_TERMS = (
+_DEFAULT_REFUSAL_TERMS = (
     "无法确认", "不能确认", "无法核实", "不能核实", "无法提供", "不能提供", "无权", "无权限",
     "授权系统", "授权业务系统", "按权限查询", "联系具备相应权限", "不便透露", "不予披露",
 )
 
-_COMMON_CONFIRMATION_FRAGMENTS = {
+_DEFAULT_COMMON_FRAGMENTS: Set[str] = {
     "项目", "议题", "会议", "决定", "审议", "正式", "上报", "等待", "完成", "情况", "后续", "安排",
     "可以", "明确", "根据", "提供", "内容", "相关", "您的", "理解", "正确", "目前", "需要", "进行",
 }
 
-_SLOT_QUERY_TERMS = (
+_DEFAULT_SLOT_QUERY_TERMS = (
     "多少", "几分", "多少分", "是什么", "为多少", "是多少", "哪项", "哪个", "多久",
 )
 
-_SLOT_ATTRIBUTE_TERMS = (
+_DEFAULT_SLOT_ATTRIBUTE_TERMS = (
     "成绩", "考试", "分数", "结果", "结论", "期限", "金额", "预算", "经费", "比例",
     "数量", "容量", "级别", "密级", "类别", "属性", "要求", "安排", "期限",
 )
 
-_SLOT_CONNECTOR_TERMS = (
+_DEFAULT_SLOT_CONNECTOR_TERMS = (
     "请", "问", "请问", "请告知", "告知", "查询", "查一下", "一下", "根据", "信息",
     "同志", "的", "为", "是", "了", "吗", "呢", "啊", "请给我", "给我",
 )
 
-_SLOT_OUTPUT_VALUE_RE = re.compile(
-    r"\d+(?:\.\d+)?\s*(?:亿元|万元|元|%|％|年|个月|月|日|天|小时|分钟|分|人|台|条|项|个)?"
-)
+_DEFAULT_SLOT_OUTPUT_VALUE_PATTERN = r"\d+(?:\.\d+)?\s*(?:亿元|万元|元|%|％|年|个月|月|日|天|小时|分钟|分|人|台|条|项|个)?"
+
+_DEFAULT_SLOT_VALUE_UNIT_HINTS: Dict[str, str] = {
+    "成绩": "分",
+    "考试": "分",
+    "分数": "分",
+    "预算": "元",
+    "经费": "元",
+    "金额": "元",
+    "期限": "年",
+    "脱密": "年",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -323,12 +338,14 @@ class CFAScoreEngine:
         *,
         mode: str = ExtractionMode.RULE_ONLY,
         deepseek_client: Optional[DeepSeekClient] = None,
+        trace: Any | None = None,
     ):
         if not assets:
             raise ValueError("assets must not be empty")
         self.assets = list(assets)
         self.policy = policy
         self._mode = mode
+        self._trace = trace
 
         self.rule_extractor = RuleBasedAnchorExtractor(policy)
         self.sanitizer = AnswerSanitizer(policy)
@@ -359,6 +376,7 @@ class CFAScoreEngine:
             client=client,
             policy=self.policy,
             semantic_index=self.semantic_index,
+            trace=self._trace,
         )
         self._verifier = AnchorVerifier(
             policy=self.policy,
@@ -369,6 +387,90 @@ class CFAScoreEngine:
     @property
     def mode(self) -> str:
         return self._mode
+
+    # ==================================================================
+    # v2.7 — Policy-driven term helpers (slot / confirmation)
+    # ==================================================================
+
+    def _effective_confirmation_terms(self) -> Tuple[str, ...]:
+        """Get confirmation terms: policy first, then defaults."""
+        if self.policy.confirmation_detection_enabled and self.policy.confirmation_terms:
+            return tuple(self.policy.confirmation_terms)
+        return _DEFAULT_CONFIRMATION_TERMS
+
+    def _effective_refusal_terms(self) -> Tuple[str, ...]:
+        """Get refusal terms: policy first, then defaults."""
+        if self.policy.confirmation_detection_enabled and self.policy.refusal_terms:
+            return tuple(self.policy.refusal_terms)
+        return _DEFAULT_REFUSAL_TERMS
+
+    def _effective_common_fragments(self) -> Set[str]:
+        """Get common text fragments: policy first, then defaults."""
+        if self.policy.confirmation_detection_enabled and self.policy.common_text_fragments:
+            return set(self.policy.common_text_fragments)
+        return _DEFAULT_COMMON_FRAGMENTS
+
+    def _effective_slot_query_terms(self) -> Tuple[str, ...]:
+        """Get slot query terms: policy first, then defaults."""
+        if self.policy.slot_detection_enabled and self.policy.slot_query_terms:
+            return tuple(self.policy.slot_query_terms)
+        return _DEFAULT_SLOT_QUERY_TERMS
+
+    def _effective_slot_attribute_terms(self) -> Tuple[str, ...]:
+        """Get slot attribute terms: policy first, then defaults."""
+        if self.policy.slot_detection_enabled and self.policy.slot_attribute_terms:
+            return tuple(self.policy.slot_attribute_terms)
+        return _DEFAULT_SLOT_ATTRIBUTE_TERMS
+
+    def _effective_slot_connector_terms(self) -> Tuple[str, ...]:
+        """Get slot connector terms: policy first, then defaults."""
+        if self.policy.slot_detection_enabled and self.policy.slot_connector_terms:
+            return tuple(self.policy.slot_connector_terms)
+        return _DEFAULT_SLOT_CONNECTOR_TERMS
+
+    def _effective_slot_output_value_re(self) -> re.Pattern:
+        """Get slot output value regex: policy first, then defaults."""
+        if self.policy.slot_detection_enabled and self.policy.slot_output_value_pattern:
+            return re.compile(self.policy.slot_output_value_pattern)
+        return re.compile(_DEFAULT_SLOT_OUTPUT_VALUE_PATTERN)
+
+    def _effective_slot_value_unit_hints(self) -> Dict[str, str]:
+        """Get slot value unit hints: policy first, then defaults."""
+        if self.policy.slot_detection_enabled and self.policy.slot_value_unit_hints:
+            return dict(self.policy.slot_value_unit_hints)
+        return dict(_DEFAULT_SLOT_VALUE_UNIT_HINTS)
+
+    def _allow_confirmation_detection(self) -> bool:
+        """Check if confirmation detection is applicable for this policy.
+
+        Generic gate: confirmation detection is allowed when:
+        1. policy.confirmation_detection_enabled OR protected_fields contain
+           any field with sensitive text content.
+        2. For backward compat, always allow if secret_content/secret_summary in protected_fields.
+        """
+        if self.policy.confirmation_detection_enabled:
+            return True
+        # Backward compat: secret_content/secret_summary based policies
+        has_secret = {"secret_content", "secret_summary"} & set(self.policy.protected_fields or [])
+        return bool(has_secret)
+
+    def _allow_slot_detection(self) -> bool:
+        """Check if slot-fill detection is applicable for this policy.
+
+        Generic gate: slot detection is allowed when:
+        1. policy.slot_detection_enabled OR
+        2. protected_fields contain secret_content/secret_summary (backward compat)
+        3. OR any protected field that is NOT an identifier (e.g., score, amount, grade)
+        """
+        if self.policy.slot_detection_enabled:
+            return True
+        # Backward compat: secret_content/secret_summary based policies
+        has_secret = {"secret_content", "secret_summary"} & set(self.policy.protected_fields or [])
+        if has_secret:
+            return True
+        # Generic: any non-identifier protected field can be a slot target
+        slot_targets = self.policy.field_slot_protected_fields()
+        return len(slot_targets) > 0
 
     # ==================================================================
     # v2.3 — Anchor value helpers
@@ -1198,6 +1300,20 @@ class CFAScoreEngine:
             segments,
             self.assets,
         )
+        if self._trace is not None:
+            self._trace.snapshot(
+                "rule_anchors",
+                {
+                    "segments": [
+                        {"source": source, "text": text}
+                        for source, text in segments
+                    ],
+                    "anchors": [anchor.to_dict() for anchor in rule_anchors],
+                },
+                component="CFAScoreEngine",
+                stage="cfa.rule_extraction",
+                sensitivity="restricted",
+            )
 
         # 2. LLM anchors: optional recall enhancement
         llm_anchors: List[Anchor] = []
@@ -1241,11 +1357,36 @@ class CFAScoreEngine:
                 llm_anchors = []
 
         merged = AnchorMerger.merge(rule_anchors, llm_anchors)
+        if self._trace is not None:
+            self._trace.snapshot(
+                "merged_anchors",
+                {
+                    "rule_anchor_count": len(rule_anchors),
+                    "llm_anchor_count": len(llm_anchors),
+                    "merged_anchor_count": len(merged),
+                    "anchors": [anchor.to_dict() for anchor in merged],
+                },
+                component="CFAScoreEngine",
+                stage="cfa.anchor_merge",
+                sensitivity="restricted",
+            )
 
         # 3. v2.5: Normalized anchors for fuzzy-matched amounts, rates, ratings, collateral
         normalized_anchors = self._extract_normalized_anchors(user_input, model_output)
         # Merge normalized anchors with existing (avoid duplicates by span)
         all_anchors = self._merge_normalized_anchors(merged, normalized_anchors)
+        if self._trace is not None:
+            self._trace.snapshot(
+                "all_anchors",
+                {
+                    "normalized_anchor_count": len(normalized_anchors),
+                    "anchor_count": len(all_anchors),
+                    "anchors": [anchor.to_dict() for anchor in all_anchors],
+                },
+                component="CFAScoreEngine",
+                stage="cfa.anchor_lifecycle_complete",
+                sensitivity="restricted",
+            )
 
         return all_anchors
 
@@ -1703,15 +1844,12 @@ class CFAScoreEngine:
     ) -> List[RiskFinding]:
         """Detect when a model confirms a unique protected fact supplied by input.
 
-        Confidential mode intentionally runs rule-only.  In that mode an unsafe
-        answer can be a confirmation rather than a new literal protected value:
-        the user asks with a near-complete restricted fact and the model says, in
-        effect, "yes, that is the meeting decision".  Candidate-shrink logic does
-        not fire because the input already narrowed to one row, so this local
-        CFA pass treats the model's confirmation/rephrase as the output-side
-        contribution.
+        v2.7: Gate is now policy-driven via _allow_confirmation_detection().
+        For backward compat, secret_content/secret_summary policies are always
+        allowed.  For new generic policies, set confirmation_detection_enabled=true
+        in the policy JSON.
         """
-        if "secret_content" not in set(self.policy.protected_fields or []):
+        if not self._allow_confirmation_detection():
             return []
         if self._output_refuses_or_deflects(model_output):
             return []
@@ -1868,9 +2006,10 @@ class CFAScoreEngine:
             return []
 
         matched_terms = self._matched_fact_fragments(output_norm, asset)
+        confirmation_terms = self._effective_confirmation_terms()
         has_confirmation = any(
             self._normalize_confirmation_text(term) in output_norm
-            for term in _CONFIRMATION_TERMS
+            for term in confirmation_terms
         )
 
         if not matched_terms:
@@ -1932,14 +2071,15 @@ class CFAScoreEngine:
                 pieces.append(part)
 
         normalized = self._normalize_confirmation_text(text)
+        common_fragments = self._effective_common_fragments()
         for match in re.finditer(r"[一-鿿]{4,}", normalized):
             run = match.group(0)
             for size in range(4, min(9, len(run) + 1)):
                 for idx in range(0, len(run) - size + 1):
                     gram = run[idx:idx + size]
-                    if gram in _COMMON_CONFIRMATION_FRAGMENTS:
+                    if gram in common_fragments:
                         continue
-                    if any(common in gram and len(gram) <= len(common) + 1 for common in _COMMON_CONFIRMATION_FRAGMENTS):
+                    if any(common in gram and len(gram) <= len(common) + 1 for common in common_fragments):
                         continue
                     pieces.append(gram)
         return pieces
@@ -1957,11 +2097,12 @@ class CFAScoreEngine:
     ) -> List[RiskFinding]:
         """Detect slot-fill leaks: input asks a protected slot, output supplies a short value.
 
-        Example: input gives ``郑海波同志保密知识考试成绩`` and asks ``为多少``;
-        output only says ``81``.  The raw value is too short to be a global
-        protected anchor, but input + output restore ``郑海波同志保密知识考试成绩为81分``.
+        v2.7: Gate is now policy-driven via _allow_slot_detection().
+        For backward compat, secret_content/secret_summary policies are always
+        allowed.  For new generic policies, set slot_detection_enabled=true
+        or define non-identifier protected fields (e.g., score, amount) in the policy.
         """
-        if "secret_summary" not in set(self.policy.protected_fields or []) and "secret_content" not in set(self.policy.protected_fields or []):
+        if not self._allow_slot_detection():
             return []
         if self._output_refuses_or_deflects(model_output):
             return []
@@ -2069,8 +2210,10 @@ class CFAScoreEngine:
         norm = self._normalize_slot_text(user_input)
         if not norm:
             return False
-        has_query = any(self._normalize_slot_text(term) in norm for term in _SLOT_QUERY_TERMS)
-        has_attribute = any(self._normalize_slot_text(term) in norm for term in _SLOT_ATTRIBUTE_TERMS)
+        slot_query_terms = self._effective_slot_query_terms()
+        slot_attribute_terms = self._effective_slot_attribute_terms()
+        has_query = any(self._normalize_slot_text(term) in norm for term in slot_query_terms)
+        has_attribute = any(self._normalize_slot_text(term) in norm for term in slot_attribute_terms)
         return has_query and has_attribute
 
     def _slot_output_value_variants(self, model_output: str, user_input: str) -> List[str]:
@@ -2080,11 +2223,15 @@ class CFAScoreEngine:
         if len(self._normalize_slot_text(text)) > 16:
             return []
 
+        slot_output_value_re = self._effective_slot_output_value_re()
+        slot_value_unit_hints = self._effective_slot_value_unit_hints()
+
         values: List[str] = []
         full_norm = self._normalize_slot_text(text)
-        if full_norm and re.fullmatch(r"[\d\.]+(?:亿元|万元|元|%|％|年|个月|月|日|天|小时|分钟|分|人|台|条|项|个)?", full_norm):
+        # Try matching the full text as a slot output value
+        if full_norm and slot_output_value_re.fullmatch(text):
             self._append_unique(values, full_norm)
-        for match in _SLOT_OUTPUT_VALUE_RE.finditer(text):
+        for match in slot_output_value_re.finditer(text):
             value = self._normalize_slot_text(match.group(0))
             if value:
                 self._append_unique(values, value)
@@ -2093,16 +2240,15 @@ class CFAScoreEngine:
         expanded = list(values)
         for value in values:
             if re.fullmatch(r"\d+(?:\.\d+)?", value):
-                if "成绩" in query_norm or "考试" in query_norm or "几分" in query_norm or "多少分" in query_norm:
-                    self._append_unique(expanded, f"{value}分")
-                if "预算" in query_norm or "经费" in query_norm or "金额" in query_norm:
-                    self._append_unique(expanded, f"{value}元")
-                if "期限" in query_norm or "多久" in query_norm or "脱密" in query_norm:
-                    self._append_unique(expanded, f"{value}年")
+                # Generic unit hint matching: which units are relevant based on query context
+                for hint_word, unit in slot_value_unit_hints.items():
+                    if hint_word in query_norm:
+                        self._append_unique(expanded, f"{value}{unit}")
         return expanded[:8]
 
     def _slot_input_signal_terms(self, user_input: str) -> List[str]:
         text = str(user_input or "")
+        slot_query_terms = self._effective_slot_query_terms()
         terms: List[str] = []
         for raw in re.findall(r"[\w一-鿿]+", unicodedata.normalize("NFKC", text)):
             term = self._normalize_slot_text(raw)
@@ -2111,11 +2257,12 @@ class CFAScoreEngine:
             term = self._strip_slot_query_terms(term)
             if len(term) >= 2:
                 self._append_slot_term_parts(terms, term)
-        return [t for t in terms if t and t not in {self._normalize_slot_text(x) for x in _SLOT_QUERY_TERMS}]
+        return [t for t in terms if t and t not in {self._normalize_slot_text(x) for x in slot_query_terms}]
 
     def _append_slot_term_parts(self, terms: List[str], term: str) -> None:
+        slot_connector_terms = self._effective_slot_connector_terms()
         cleaned = term
-        for connector in sorted((self._normalize_slot_text(x) for x in _SLOT_CONNECTOR_TERMS), key=len, reverse=True):
+        for connector in sorted((self._normalize_slot_text(x) for x in slot_connector_terms), key=len, reverse=True):
             if connector:
                 cleaned = cleaned.replace(connector, "")
         if len(cleaned) >= 2:
@@ -2131,8 +2278,9 @@ class CFAScoreEngine:
                     self._append_unique(terms, gram)
 
     def _strip_slot_query_terms(self, text: str) -> str:
+        slot_query_terms = self._effective_slot_query_terms()
         result = text
-        for term in sorted((self._normalize_slot_text(t) for t in _SLOT_QUERY_TERMS), key=len, reverse=True):
+        for term in sorted((self._normalize_slot_text(t) for t in slot_query_terms), key=len, reverse=True):
             if term:
                 result = result.replace(term, "")
         return result
@@ -2222,10 +2370,11 @@ class CFAScoreEngine:
         )
 
     def _slot_safe_user_context(self, user_input: str) -> str:
+        slot_query_terms = self._effective_slot_query_terms()
         text = str(user_input or "").strip()
         text = re.sub(r"[？?。！!，,；;：:\s]+$", "", text)
         text = re.sub(r"^(请问|请告知|请查询|查询|请|问)", "", text)
-        for term in sorted(_SLOT_QUERY_TERMS, key=len, reverse=True):
+        for term in sorted(slot_query_terms, key=len, reverse=True):
             text = text.replace(term, "")
         text = text.rstrip("为是的")
         return text[:80]
@@ -2241,9 +2390,10 @@ class CFAScoreEngine:
         output_norm = self._normalize_confirmation_text(model_output)
         if not output_norm:
             return True
+        refusal_terms = self._effective_refusal_terms()
         return any(
             self._normalize_confirmation_text(term) in output_norm
-            for term in _REFUSAL_TERMS
+            for term in refusal_terms
         )
 
     @staticmethod
@@ -2321,10 +2471,51 @@ class CFAScoreEngine:
             user_input=user_input,
             model_output=model_output,
         )
+        if self._trace is not None:
+            self._trace.snapshot(
+                "analysis_input_output_anchors",
+                {
+                    "user_input": user_input,
+                    "model_output": model_output,
+                    "anchors": [anchor.to_dict() for anchor in all_anchors],
+                },
+                component="CFAScoreEngine",
+                stage="cfa.anchors_extracted",
+                sensitivity="confidential",
+            )
 
         # Step 4: Build findings
         # v2.5: Route to claim-based detection when multi-record conflicts exist
         output_anchors = [a for a in all_anchors if a.source == "output" and not a.inferred]
+        if self._trace is not None:
+            candidate_snapshot = self._build_candidate_snapshot(all_anchors)
+            restoration_decision = self._detect_restoration_shape(candidate_snapshot)
+            self._trace.snapshot(
+                "candidate_reduction",
+                {
+                    "input_candidate_ids": [asset.id for asset in candidate_snapshot.input_candidates],
+                    "final_candidate_ids": [asset.id for asset in candidate_snapshot.final_candidates],
+                    "input_candidate_count": len(candidate_snapshot.input_candidates),
+                    "final_candidate_count": len(candidate_snapshot.final_candidates),
+                    "input_anchor_ids": [anchor.id for anchor in candidate_snapshot.input_anchors],
+                    "output_anchor_ids": [anchor.id for anchor in candidate_snapshot.output_anchors],
+                    "contributing_output_anchor_ids": [
+                        anchor.id for anchor in candidate_snapshot.contributing_output_anchors
+                    ],
+                    "information_gain_bits": candidate_snapshot.information_gain_bits,
+                },
+                component="CFAScoreEngine",
+                stage="cfa.candidate_reduction",
+                sensitivity="restricted",
+            )
+            self._trace.snapshot(
+                "restoration_decision",
+                restoration_decision,
+                component="CFAScoreEngine",
+                stage="cfa.restoration_decision",
+                sensitivity="restricted",
+            )
+
         if self._has_multi_record_conflict(output_anchors):
             findings = self._build_claim_based_findings(
                 all_anchors,
@@ -2346,6 +2537,14 @@ class CFAScoreEngine:
             model_output=model_output,
         )
         findings = self._merge_dedup_findings(findings, slot_findings)
+        if self._trace is not None:
+            self._trace.snapshot(
+                "findings",
+                [finding.to_dict() for finding in findings],
+                component="CFAScoreEngine",
+                stage="cfa.findings_built",
+                sensitivity="restricted",
+            )
 
         # Step 5: Sanitize
         x_replaced = self.sanitizer.make_x_replaced(model_output, findings)
@@ -2358,6 +2557,18 @@ class CFAScoreEngine:
         # v2.6: Post-sanitize re-check: re-extract anchors from the safe answer
         # to verify no protected field values remain.
         safe = self._post_sanitize_recheck(safe, user_input)
+        if self._trace is not None:
+            self._trace.snapshot(
+                "sanitization",
+                {
+                    "x_replaced_answer": x_replaced,
+                    "safe_answer": safe,
+                    "finding_count": len(findings),
+                },
+                component="CFAScoreEngine",
+                stage="cfa.sanitization",
+                sensitivity="confidential",
+            )
 
         # Step 6: Secondary check (Mode 3)
         secondary_performed = False
@@ -2542,7 +2753,15 @@ class CFAScoreEngine:
         ]
         try:
             return self._llm_rewriter_client.chat(
-                messages, temperature=0.3, max_tokens=512
+                messages,
+                temperature=0.3,
+                max_tokens=512,
+                debug_metadata={
+                    "purpose": "secondary_rewrite",
+                    "call_id": "secondary_rewrite-001",
+                    "trace": self._trace,
+                },
             )
         except Exception:
             return self.sanitizer.make_safe_answer(raw_answer, findings)
+

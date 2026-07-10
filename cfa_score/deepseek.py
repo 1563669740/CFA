@@ -1,7 +1,8 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -96,6 +97,7 @@ class DeepSeekClient:
         注意：这里不保存 Authorization 请求头，所以不会暴露 API Key。
         """
         metadata = dict(debug_metadata or {})
+        metadata.pop("trace", None)
         request_id = str(metadata.get("request_id") or "")
         purpose = str(metadata.get("purpose") or "llm_call")
         captured_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -143,6 +145,11 @@ class DeepSeekClient:
         max_tokens: int = 512,
         debug_metadata: Mapping[str, Any] | None = None,
     ) -> str:
+        debug_metadata = debug_metadata or {}
+        trace = debug_metadata.get("trace") if isinstance(debug_metadata, Mapping) else None
+        purpose = str(debug_metadata.get("purpose") or "llm_call")
+        call_id = str(debug_metadata.get("call_id") or purpose)
+
         # P0 安全断言：在发送外部 LLM 请求前，拦截 prompt 中的泄密内容
         _assert_no_confidential_prompt(messages)
 
@@ -152,6 +159,40 @@ class DeepSeekClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+
+        if trace is not None:
+            clean_metadata = {
+                key: value
+                for key, value in dict(debug_metadata).items()
+                if key != "trace"
+            }
+            trace.snapshot(
+                f"{call_id}_request",
+                {
+                    "call_id": call_id,
+                    "purpose": purpose,
+                    "model": self.config.model,
+                    "base_url": self.config.base_url,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "messages": list(messages),
+                    "debug_metadata": clean_metadata,
+                },
+                component="DeepSeekClient",
+                stage="llm_request",
+                directory="llm",
+                sensitivity="confidential",
+            )
+            trace.emit(
+                component="DeepSeekClient",
+                stage="llm_request",
+                event_type="start",
+                payload={
+                    "call_id": call_id,
+                    "purpose": purpose,
+                    "model": self.config.model,
+                },
+            )
 
         if os.environ.get("CFA_DEBUG_LLM_PAYLOAD", "0") == "1":
             self._write_debug_payload(payload, debug_metadata=debug_metadata)
@@ -165,22 +206,127 @@ class DeepSeekClient:
             },
             method="POST",
         )
+        started = time.perf_counter()
         try:
             with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as response:
+                http_status = response.status
                 body = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
+            latency_ms = (time.perf_counter() - started) * 1000
             detail = exc.read().decode("utf-8", errors="replace")
+            if trace is not None:
+                trace.snapshot(
+                    f"{call_id}_error",
+                    {
+                        "call_id": call_id,
+                        "purpose": purpose,
+                        "http_status": exc.code,
+                        "latency_ms": latency_ms,
+                        "error_type": "HTTPError",
+                        "error_message": detail,
+                    },
+                    component="DeepSeekClient",
+                    stage="llm_error",
+                    directory="llm",
+                    sensitivity="restricted",
+                )
+                trace.emit(
+                    component="DeepSeekClient",
+                    stage="llm_request",
+                    event_type="error",
+                    status="failed",
+                    elapsed_ms=latency_ms,
+                    payload={
+                        "call_id": call_id,
+                        "http_status": exc.code,
+                        "error_type": "HTTPError",
+                    },
+                )
             raise RuntimeError(f"DeepSeek request failed with HTTP {exc.code}: {detail}") from exc
         except urllib.error.URLError as exc:
+            latency_ms = (time.perf_counter() - started) * 1000
+            if trace is not None:
+                trace.snapshot(
+                    f"{call_id}_error",
+                    {
+                        "call_id": call_id,
+                        "purpose": purpose,
+                        "latency_ms": latency_ms,
+                        "error_type": "URLError",
+                        "error_message": str(exc.reason),
+                    },
+                    component="DeepSeekClient",
+                    stage="llm_error",
+                    directory="llm",
+                    sensitivity="restricted",
+                )
+                trace.emit(
+                    component="DeepSeekClient",
+                    stage="llm_request",
+                    event_type="error",
+                    status="failed",
+                    elapsed_ms=latency_ms,
+                    payload={
+                        "call_id": call_id,
+                        "error_type": "URLError",
+                        "error_message": str(exc.reason),
+                    },
+                )
             raise RuntimeError(f"DeepSeek request failed: {exc.reason}") from exc
 
+        latency_ms = (time.perf_counter() - started) * 1000
         data = json.loads(body)
         try:
-            return str(data["choices"][0]["message"]["content"]).strip()
+            content = str(data["choices"][0]["message"]["content"]).strip()
         except (KeyError, IndexError, TypeError) as exc:
+            if trace is not None:
+                trace.snapshot(
+                    f"{call_id}_unexpected_response",
+                    {
+                        "call_id": call_id,
+                        "purpose": purpose,
+                        "http_status": http_status,
+                        "latency_ms": latency_ms,
+                        "raw_response": data,
+                    },
+                    component="DeepSeekClient",
+                    stage="llm_response_parse",
+                    directory="llm",
+                    sensitivity="restricted",
+                )
             raise RuntimeError(f"Unexpected DeepSeek response shape: {body}") from exc
 
+        if trace is not None:
+            trace.snapshot(
+                f"{call_id}_response",
+                {
+                    "call_id": call_id,
+                    "purpose": purpose,
+                    "http_status": http_status,
+                    "latency_ms": latency_ms,
+                    "raw_response": data,
+                    "content": content,
+                },
+                component="DeepSeekClient",
+                stage="llm_response",
+                directory="llm",
+                sensitivity="confidential",
+            )
+            trace.emit(
+                component="DeepSeekClient",
+                stage="llm_request",
+                event_type="end",
+                elapsed_ms=latency_ms,
+                payload={
+                    "call_id": call_id,
+                    "http_status": http_status,
+                    "content_length": len(content),
+                },
+            )
+
+        return content
 
 def _safe_debug_name(value: str) -> str:
     cleaned = "".join(ch if ch.isalnum() or ch in "_-" else "_" for ch in str(value))
     return cleaned[:80] or "llm_call"
+

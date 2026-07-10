@@ -126,6 +126,9 @@ class _CFAHandler(BaseHTTPRequestHandler):
         scenario = body.get("scenario", "auto")
         mode = body.get("mode", "rule_only")
         secondary_check = body.get("secondary_check", False)
+        include_confidential_raw_demo = bool(body.get("include_confidential_raw_demo", False))
+        confidential_raw_demo_mode = str(body.get("confidential_raw_demo_mode", "raw") or "raw")
+        include_confidential_cfa_evidence = bool(body.get("include_confidential_cfa_evidence", False))
 
         try:
             resp = self.gateway.handle_chat(
@@ -133,6 +136,9 @@ class _CFAHandler(BaseHTTPRequestHandler):
                 scenario=scenario,
                 mode=mode,
                 secondary_check=secondary_check,
+                include_confidential_raw_demo=include_confidential_raw_demo,
+                confidential_raw_demo_mode=confidential_raw_demo_mode,
+                include_confidential_cfa_evidence=include_confidential_cfa_evidence,
             )
             self._respond(200, resp.to_dict(debug=False))
         except ValueError as exc:
@@ -156,6 +162,7 @@ class _CFAHandler(BaseHTTPRequestHandler):
         scenario = body.get("scenario", "healthcare")
         mode = body.get("mode", "rule_only")
         secondary_check = body.get("secondary_check", False)
+        include_confidential_cfa_evidence = bool(body.get("include_confidential_cfa_evidence", False))
 
         try:
             resp = self.gateway.handle_analyze(
@@ -164,6 +171,7 @@ class _CFAHandler(BaseHTTPRequestHandler):
                 scenario=scenario,
                 mode=mode,
                 secondary_check=secondary_check,
+                include_confidential_cfa_evidence=include_confidential_cfa_evidence,
             )
             self._respond(200, resp.to_dict(debug=False))
         except ValueError as exc:
@@ -280,21 +288,36 @@ class _CFAHandler(BaseHTTPRequestHandler):
             raw = path.read_text(encoding="utf-8-sig")
             data = json.loads(raw)
 
-            # P0 安全：payload 中不得包含保密库敏感标记
+            # P0 安全：payload 中不得包含原始保密库/整行 JSONL 的禁发字段或高危标记。
+            # 第二阶段调试 payload 允许展示已选 content_units（本实验目标），
+            # 但仍不能包含 source_secret_id / retrieval_terms 等整行来源字段。
             confidential_markers = [
                 "SEC-", "保密内容=", "保密关键词=", "保密类别=", "保密摘要=",
                 "保密事实库", "密级=", "机密★", "绝密★", "秘密★",
                 "【内部资产台账】",
             ]
+            forbidden_payload_fields = [
+                "source_secret_id",
+                "source_confidential_level",
+                "retrieval_terms",
+                "do_not_send_to_llm_fields",
+                "evaluation_note",
+                "risk_level",
+                "llm_visible_text",
+            ]
             raw_lower = raw.lower()
-            if any(m in raw for m in confidential_markers) or any(m.lower() in raw_lower for m in confidential_markers):
+            marker_hits = [m for m in confidential_markers if m in raw or m.lower() in raw_lower]
+            field_hits = [f for f in forbidden_payload_fields if f in raw]
+            if marker_hits or field_hits:
                 try:
                     path.unlink()
                 except OSError:
                     pass
                 self._respond(403, {
-                    "error": "debug payload 包含保密库标记，已自动删除。"
-                            "请重新发起一次安全的对话请求以生成新的 debug payload。"
+                    "error": "debug payload 包含保密库禁发字段或高危标记，已自动删除。"
+                            "请重新发起一次安全的对话请求以生成新的 debug payload。",
+                    "markers": marker_hits,
+                    "fields": field_hits,
                 })
                 return
 

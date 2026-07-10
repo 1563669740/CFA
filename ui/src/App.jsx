@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useMemo } from 'react';
 import {
   cfaChat,
   cfaAnalyze,
@@ -78,6 +78,20 @@ const STRATEGY_LABELS = {
   need_city_prompt:  '天气查询（需追问城市）',
 };
 
+const FINDING_TYPE_LABELS = {
+  direct_protected_disclosure: '直接披露受保护字段',
+  indirect_asset_restoration: '组合定位到单条事实',
+  indirect_protected_value_restoration: '受保护字段值收敛',
+  input_hypothesis_confirmation: '用户假设被模型确认',
+  direct_confidential_value_match: '本地直接命中保密值',
+};
+
+function formatNumber(value, digits = 2) {
+  if (value === undefined || value === null || value === '') return '-';
+  const n = Number(value);
+  return Number.isFinite(n) ? n.toFixed(digits) : String(value);
+}
+
 /* ================================================================
    Output Section
    ================================================================ */
@@ -119,6 +133,23 @@ function OutputSection({ loading, error, result }) {
   const isConfidential = result.routed_scenario === 'confidential';
   const publicFindings = (!isConfidential && Array.isArray(result.findings_summary))
     ? result.findings_summary
+    : [];
+  const displayedRawAnswer = isConfidential
+    ? (result.demo_raw_answer || result.demo_raw_answer_redacted)
+    : result.raw_answer;
+  const confidentialRawIsRedacted = isConfidential && !result.demo_raw_answer && Boolean(result.demo_raw_answer_redacted);
+  const rawAnswerTitle = isConfidential
+    ? (confidentialRawIsRedacted ? '📝 LLM 原始回答（脱敏演示）' : '📝 LLM 原始回答（未拦截）')
+    : '📝 LLM 原始回答';
+  const rawDiffLabel = isConfidential
+    ? (confidentialRawIsRedacted
+      ? '📝 LLM 原始回答（脱敏演示，不一致部分标红）'
+      : '📝 LLM 原始输出（未拦截，不一致部分标红）')
+    : '📝 LLM 原始输出（不一致部分标红）';
+  const hasDiffView = Boolean(displayedRawAnswer && result.answer);
+  const contextSummary = result.confidential_context_summary;
+  const cfaEvidence = Array.isArray(result.confidential_cfa_evidence)
+    ? result.confidential_cfa_evidence
     : [];
 
   return (
@@ -182,8 +213,115 @@ function OutputSection({ loading, error, result }) {
         <div className="answer-card" style={{ borderLeft: '3px solid var(--red)' }}>
           <div className="card-title">🛡️ 保密场景已拦截</div>
           <div className="card-body" style={{ fontSize: '0.88rem' }}>
-            本次回答可能使保密事实被唯一还原。系统仅展示公共安全响应，命中事实编号和还原链只写入后端审计日志。
+            本次回答可能使保密事实被唯一还原。最终答复已由 CFA/本地闸门改写为安全响应；下方实验对照卡片可展示 CFA 还原出的受限事实。
           </div>
+        </div>
+      )}
+
+      {isConfidential && contextSummary && (
+        <div className="answer-card confidential-context-card">
+          <div className="card-title">
+            {contextSummary.kb_type === 'progressive_confidential_internal_kb'
+              ? '🧩 LLM 分步加载的内部知识库摘要'
+              : '🧩 LLM 携带的安全知识库摘要'}
+          </div>
+          <div className="context-badges">
+            <span className="context-badge sanitized">
+              {contextSummary.kb_type === 'progressive_confidential_internal_kb' ? '分步按需加载' : '仅脱敏摘要'}
+            </span>
+            <span className="context-badge not-sent">原始事实不整体发送给 LLM</span>
+            <span className="context-badge backend-only">命中证据仅后端审计</span>
+          </div>
+          <div className="context-grid">
+            <div><strong>类型：</strong>{contextSummary.kb_type}</div>
+            <div><strong>记录总数：</strong>{contextSummary.total_records}</div>
+            {contextSummary.kb_type === 'progressive_confidential_internal_kb' ? (
+              <>
+                <div><strong>目录发送条数：</strong>{contextSummary.catalog_entries_sent}</div>
+                <div><strong>选择来源：</strong>{contextSummary.selection_source}</div>
+                <div><strong>已选 KB 数：</strong>{contextSummary.selected_kb_count}</div>
+                <div><strong>已选 content_units：</strong>{contextSummary.selected_content_unit_count}</div>
+                <div><strong>阶段1状态：</strong>{contextSummary.stage1_status}</div>
+                <div><strong>阶段2状态：</strong>{contextSummary.stage2_status}</div>
+              </>
+            ) : (
+              <>
+                <div><strong>相关：</strong>{contextSummary.current_query?.related ? '是' : '否'}</div>
+                <div><strong>安全主题：</strong>{contextSummary.current_query?.safe_topic}</div>
+                <div><strong>命中数量桶：</strong>{contextSummary.current_query?.matched_count_bucket}</div>
+              </>
+            )}
+          </div>
+          {contextSummary.coverage && (
+            <div className="context-coverage">
+              {Object.entries(contextSummary.coverage).map(([key, value]) => (
+                <span key={key}>{key}: {value}</span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {isConfidential && cfaEvidence.length > 0 && (
+        <div className="answer-card cfa-evidence-card">
+          <div className="card-title">🧬 CFA 还原的受限事实（实验对照）</div>
+          <div className="safe-note">
+            该区域用于本地实验对照：展示 CFA 根据“用户输入 + LLM 原始候选回答”还原出的受限事实，便于与左侧保密库核对。
+          </div>
+          {cfaEvidence.map((item, idx) => (
+            <div className="cfa-evidence-item" key={`${item.target_id || 'finding'}-${idx}`}>
+              <div className="cfa-evidence-head">
+                <span className={`evidence-level ${RISK_CLASS(item.risk_level)}`}>{item.risk_level}</span>
+                <strong>{item.target_name || item.target_id || `风险发现 #${idx + 1}`}</strong>
+                <span>{FINDING_TYPE_LABELS[item.finding_type] || item.finding_type}</span>
+                <span>得分 {formatNumber(item.score, 1)}</span>
+              </div>
+              {item.restored_fact && (
+                <div className="restored-fact"><strong>还原事实：</strong>{item.restored_fact}</div>
+              )}
+              {Array.isArray(item.restored_fields) && item.restored_fields.length > 0 && (
+                <div className="evidence-fields">
+                  {item.restored_fields.map((field) => (
+                    <span className="field-chip" key={`${field.name}-${field.value}`}>
+                      {field.label || field.name}: {field.value || '-'}
+                    </span>
+                  ))}
+                </div>
+              )}
+              {item.reason && <div className="evidence-reason">{item.reason}</div>}
+              {Array.isArray(item.reasoning_process) && item.reasoning_process.length > 0 && (
+                <div className="evidence-reasoning">
+                  <strong>CFA 推理过程：</strong>
+                  <ol>
+                    {item.reasoning_process.map((step, i2) => <li key={`${step}-${i2}`}>{step}</li>)}
+                  </ol>
+                </div>
+              )}
+              {Array.isArray(item.key_anchors) && item.key_anchors.length > 0 && (
+                <div className="evidence-anchors">
+                  <strong>关键锚点：</strong>
+                  {item.key_anchors.map((anchor, i2) => <span key={`${anchor}-${i2}`}>{anchor}</span>)}
+                </div>
+              )}
+              <div className="evidence-stats">
+                <span>输入候选：{item.input_candidate_count || 0}</span>
+                <span>最终候选：{item.final_candidate_count || 0}</span>
+                <span>信息增益：{formatNumber(item.information_gain_bits)} bit</span>
+              </div>
+              {Array.isArray(item.reduction_chain) && item.reduction_chain.length > 0 && (
+                <div className="reduction-table">
+                  {item.reduction_chain.map((step, i2) => (
+                    <div className="reduction-row" key={`${step.field_name}-${step.canonical_value}-${i2}`}>
+                      <span>{step.field_label || step.field_name}</span>
+                      <span>{step.match_symbol || '='}{step.canonical_value}</span>
+                      <span>{step.before_count} → {step.after_count}</span>
+                      <span>{(step.remaining_asset_ids || []).join(', ')}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
         </div>
       )}
 
@@ -217,23 +355,43 @@ function OutputSection({ loading, error, result }) {
       ))}
 
       {/* Diff Comparison View */}
-      {!isConfidential && result.raw_answer && result.answer && (
-        <DiffView rawAnswer={result.raw_answer} safeAnswer={result.answer} />
+      {hasDiffView && (
+        <DiffView
+          rawAnswer={displayedRawAnswer}
+          safeAnswer={result.answer}
+          rawLabel={rawDiffLabel}
+          safeLabel="🔒 CFA 安全回答（不一致部分标蓝）"
+        />
       )}
 
-      {/* Raw Answer (LLM 原始输出) */}
-      {!isConfidential && result.raw_answer && !result.answer && (
-        <div className="answer-card">
-          <div className="card-title">
-            📝 LLM 原始输出
-            <button className="copy-btn" onClick={() => copyText(result.raw_answer)}>📋 复制</button>
+      {isConfidential && !displayedRawAnswer && (
+        <div className="answer-card" style={{ borderLeft: '3px solid var(--yellow)' }}>
+          <div className="card-title">📝 LLM 原始回答未展开</div>
+          <div className="card-body" style={{ fontSize: '0.88rem' }}>
+            保密场景默认不返回原始回答。如需演示差异，请启用左侧“展示 LLM 原始回答”。
           </div>
-          <div className="card-body">{result.raw_answer}</div>
         </div>
       )}
 
-      {/* Safe Answer */}
-      {result.answer && (isConfidential || !result.raw_answer) && (
+      {/* Fallback single-answer cards when diff cannot be shown */}
+      {!hasDiffView && displayedRawAnswer && (
+        <div className={`answer-card ${isConfidential ? 'redacted-raw-card' : ''}`}>
+          <div className="card-title">
+            {rawAnswerTitle}
+            <button className="copy-btn" onClick={() => copyText(displayedRawAnswer)}>📋 复制</button>
+          </div>
+          {isConfidential && (
+            <div className="safe-note">
+              {confidentialRawIsRedacted
+                ? '这里展示的是后端脱敏后的演示文本。'
+                : '这里展示 CFA 检测前的 LLM 原始候选回答，未经过最终本地闸门替换。'}
+            </div>
+          )}
+          <div className="card-body">{displayedRawAnswer}</div>
+        </div>
+      )}
+
+      {!hasDiffView && result.answer && (
         <div className="answer-card">
           <div className="card-title">
             🔒 CFA 安全回答
@@ -250,7 +408,7 @@ function OutputSection({ loading, error, result }) {
         </summary>
         {isConfidential && (
           <div className="hint" style={{ marginBottom: 8 }}>
-            保密场景仅返回公共安全响应；原始输出、命中事实编号和还原链不会出现在前端响应中。
+            保密场景默认不返回原始输出；本地实验模式会按需返回 LLM 原始候选回答和 CFA 还原证据用于页面对照。
           </div>
         )}
         <div className="raw-json">{JSON.stringify(result, null, 2)}</div>
@@ -263,6 +421,12 @@ function copyText(text) {
   navigator.clipboard.writeText(text).then(() => {
     // brief visual feedback is nice but keep it simple
   }).catch(() => {});
+}
+
+function formatFactValue(value) {
+  if (Array.isArray(value)) return value.join('；');
+  if (value && typeof value === 'object') return JSON.stringify(value, null, 2);
+  return String(value ?? '');
 }
 
 /* ================================================================
@@ -621,10 +785,218 @@ function ProtectedFactPanel({ currentScenario }) {
 }
 
 /* ================================================================
+   Confidential KB Browser
+   ================================================================ */
+function ConfidentialKbBrowser() {
+  const [schema, setSchema] = useState(null);
+  const [factsInfo, setFactsInfo] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState('');
+  const [query, setQuery] = useState('');
+  const [category, setCategory] = useState('all');
+  const [level, setLevel] = useState('all');
+  const [maskProtected, setMaskProtected] = useState(false);
+  const [expanded, setExpanded] = useState({});
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function load() {
+      setLoading(true);
+      setErr('');
+      try {
+        const schemaData = await fetchFactSchema('confidential');
+        const factsData = await fetchProtectedFacts('confidential');
+        if (!cancelled) {
+          setSchema(schemaData);
+          setFactsInfo(factsData);
+        }
+      } catch (e) {
+        if (!cancelled) setErr(e.message || '加载保密库失败');
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+
+    load();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const facts = factsInfo?.facts || [];
+  const fields = schema?.fields || [];
+  const protectedFields = new Set(schema?.protected_fields || []);
+
+  const categories = useMemo(() => {
+    return Array.from(new Set(facts.map((f) => f.category || '未分类'))).sort();
+  }, [facts]);
+
+  const levels = useMemo(() => {
+    return Array.from(new Set(facts.map((f) => f.confidential_level || 'unknown'))).sort();
+  }, [facts]);
+
+  const filteredFacts = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return facts.filter((fact) => {
+      if (category !== 'all' && (fact.category || '未分类') !== category) return false;
+      if (level !== 'all' && (fact.confidential_level || 'unknown') !== level) return false;
+      if (!q) return true;
+      return JSON.stringify(fact, null, 0).toLowerCase().includes(q);
+    });
+  }, [facts, query, category, level]);
+
+  const visibleFields = fields.length
+    ? fields
+    : [
+        { name: 'id', label: '事实编号', protected: false },
+        { name: 'category', label: '类别', protected: false },
+        { name: 'confidential_level', label: '密级', protected: true },
+        { name: 'secret_summary', label: '摘要', protected: true },
+        { name: 'secret_content', label: '内容', protected: true },
+        { name: 'secret_keywords', label: '关键词', protected: true },
+      ];
+
+  const renderValue = (fact, field) => {
+    const value = formatFactValue(fact[field.name]);
+    if (!value) return <span className="dim-text">-</span>;
+    if (maskProtected && (field.protected || protectedFields.has(field.name))) {
+      return <span className="masked-value">[已遮罩]</span>;
+    }
+    return value;
+  };
+
+  return (
+    <div className="input-area kb-browser">
+      <div className="kb-header">
+        <div>
+          <div className="fact-title">保密库浏览</div>
+          <div className="fact-desc">
+            管理员/演示视图：这里展示导入的受保护事实。问答时这些原始事实不会整体注入 LLM，LLM 只接收后端生成的脱敏安全摘要。
+          </div>
+        </div>
+        <div className="kb-stat-card">
+          <span>当前事实</span>
+          <strong>{factsInfo?.count ?? 0}</strong>
+        </div>
+      </div>
+
+      {factsInfo?.import_meta && (
+        <div className="kb-import-meta">
+          <span>最近导入文件：{factsInfo.import_meta.filename || '未命名'}</span>
+          <span>时间：{factsInfo.import_meta.imported_at || '-'}</span>
+          <span>成功：{factsInfo.import_meta.imported}</span>
+          <span>重复：{factsInfo.import_meta.duplicates}</span>
+          <span>错误：{factsInfo.import_meta.error_count}</span>
+        </div>
+      )}
+
+      <div className="kb-warning">
+        <strong>安全边界：</strong>此页用于人工核对导入结果；外部 LLM 不携带 secret_content、secret_summary、secret_keywords、SEC ID 或还原链。
+      </div>
+
+      <div className="kb-filters">
+        <input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="搜索事实内容、摘要、关键词或 ID..."
+        />
+        <select value={category} onChange={(e) => setCategory(e.target.value)}>
+          <option value="all">全部类别</option>
+          {categories.map((item) => <option key={item} value={item}>{item}</option>)}
+        </select>
+        <select value={level} onChange={(e) => setLevel(e.target.value)}>
+          <option value="all">全部密级</option>
+          {levels.map((item) => <option key={item} value={item}>{item}</option>)}
+        </select>
+        <label className="mask-toggle">
+          <input
+            type="checkbox"
+            checked={maskProtected}
+            onChange={(e) => setMaskProtected(e.target.checked)}
+          />
+          遮罩受保护字段
+        </label>
+      </div>
+
+      {loading && <div className="hint">正在加载保密库...</div>}
+      {err && <div className="error-banner">⚠ {err}</div>}
+
+      {!loading && !err && (
+        <div className="kb-table-wrap">
+          <table className="kb-table">
+            <thead>
+              <tr>
+                <th>展开</th>
+                {visibleFields.map((field) => (
+                  <th key={field.name}>{field.label || field.name}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {filteredFacts.map((fact, idx) => {
+                const rowKey = fact.id || `row-${idx}`;
+                return (
+                  <tr key={rowKey}>
+                    <td>
+                      <button
+                        className="expand-btn"
+                        onClick={() => setExpanded((prev) => ({ ...prev, [rowKey]: !prev[rowKey] }))}
+                      >
+                        {expanded[rowKey] ? '收起' : '展开'}
+                      </button>
+                      {expanded[rowKey] && (
+                        <div className="kb-row-detail">
+                          <div><strong>攻击改写：</strong>{formatFactValue(fact.attack_paraphrases) || '-'}</div>
+                          <div><strong>负样本：</strong>{formatFactValue(fact.negative_samples) || '-'}</div>
+                          <details>
+                            <summary>查看原始 JSON</summary>
+                            <pre>{JSON.stringify(fact, null, 2)}</pre>
+                          </details>
+                        </div>
+                      )}
+                    </td>
+                    {visibleFields.map((field) => (
+                      <td key={field.name} className={field.protected ? 'protected-cell' : ''}>
+                        {renderValue(fact, field)}
+                      </td>
+                    ))}
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+          {filteredFacts.length === 0 && (
+            <div className="output-empty" style={{ minHeight: 160 }}>
+              <div className="hint">没有匹配的保密事实</div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ================================================================
    LLM Payload Debug Panel
    ================================================================ */
-function LlmPayloadPanel({ payload, error, confidential }) {
-  if (!payload && !error && !confidential) return null;
+function llmPayloadStageTitle(item) {
+  const purpose = item?.ref?.purpose || item?.payload?.purpose || '';
+  if (purpose === 'confidential_kb_selection') {
+    return '第一阶段：KB 简介/目录选择请求';
+  }
+  if (purpose === 'confidential_answer_generation') {
+    return '第二阶段：已选 content_units 回答生成请求';
+  }
+  if (purpose === 'primary_generation') {
+    return '主回答生成请求';
+  }
+  return purpose || 'LLM 请求';
+}
+
+function LlmPayloadPanel({ items = [], confidential }) {
+  const visibleItems = Array.isArray(items) ? items : [];
+  if (visibleItems.length === 0 && !confidential) return null;
 
   return (
     <details className="llm-payload-panel">
@@ -632,39 +1004,60 @@ function LlmPayloadPanel({ payload, error, confidential }) {
 
       {confidential && (
         <div className="hint" style={{ marginBottom: 8 }}>
-          保密场景仅展示调试元信息；真实 payload 正文由后端安全过滤，不在前端展开。
+          保密场景的调试 payload 可能包含按需加载后的模拟内部 KB content_units，
+          仅用于本地实验与排查；公开回答仍由后端安全门控处理。
         </div>
       )}
 
-      {error && (
+      {visibleItems.length === 0 && (
         <div className="error-banner">
-          ⚠ {error}
+          ⚠ 本次请求没有捕获到对应的 LLM 请求。可能未开启 CFA_DEBUG_LLM_PAYLOAD。
         </div>
       )}
 
-      {payload && (
-        <>
-          <div className="llm-payload-meta">
-            <span>捕获时间：{payload.captured_at}</span>
-            <span>请求 ID：{payload.request_id || '-'}</span>
-            <span>调用目的：{payload.purpose || '-'}</span>
-            <span>场景：{payload.scenario || '-'}</span>
-            <span>实际路由：{payload.effective_scenario || '-'}</span>
-            <span>模式：{payload.mode || '-'}</span>
-            <span>二次检测：{payload.secondary_check ? '是' : '否'}</span>
-            <span>注入事实池：{payload.inject_fact_pool ? '是' : '否'}</span>
-            <span>安全知识库：{payload.safe_knowledge_type || '无'}</span>
-            <span>模型：{payload.model}</span>
-            <span>接口：{payload.base_url}</span>
-          </div>
+      {visibleItems.map((item, idx) => {
+        const payload = item.payload;
+        return (
+          <div className="llm-payload-stage" key={`${item.ref?.purpose || idx}-${idx}`}>
+            <div className="llm-payload-stage-title">
+              <span>{llmPayloadStageTitle(item)}</span>
+              {item.ref?.stage && <span className="llm-payload-stage-badge">Stage {item.ref.stage}</span>}
+            </div>
 
-          {!confidential && (
-            <pre className="llm-payload-code">
-              {JSON.stringify(payload.payload, null, 2)}
-            </pre>
-          )}
-        </>
-      )}
+            {item.error && (
+              <div className="error-banner llm-payload-stage-error">
+                ⚠ {item.error}
+              </div>
+            )}
+
+            {payload && (
+              <>
+                <div className="llm-payload-meta">
+                  <span>捕获时间：{payload.captured_at}</span>
+                  <span>请求 ID：{payload.request_id || '-'}</span>
+                  <span>调用目的：{payload.purpose || '-'}</span>
+                  <span>场景：{payload.scenario || '-'}</span>
+                  <span>实际路由：{payload.effective_scenario || '-'}</span>
+                  <span>模式：{payload.mode || '-'}</span>
+                  <span>二次检测：{payload.secondary_check ? '是' : '否'}</span>
+                  <span>注入事实池：{payload.inject_fact_pool ? '是' : '否'}</span>
+                  <span>安全知识库：{payload.safe_knowledge_type || '无'}</span>
+                  {payload.selection_source && <span>选择来源：{payload.selection_source}</span>}
+                  {payload.selected_content_unit_count !== undefined && (
+                    <span>已选 units：{payload.selected_content_unit_count}</span>
+                  )}
+                  <span>模型：{payload.model}</span>
+                  <span>接口：{payload.base_url}</span>
+                </div>
+
+                <pre className="llm-payload-code">
+                  {JSON.stringify(payload.payload, null, 2)}
+                </pre>
+              </>
+            )}
+          </div>
+        );
+      })}
     </details>
   );
 }
@@ -673,10 +1066,12 @@ function LlmPayloadPanel({ payload, error, confidential }) {
    App
    ================================================================ */
 export default function App() {
-  const [mode, setMode] = useState('chat');           // 'chat' | 'analyze'
+  const [mode, setMode] = useState('chat');           // 'chat' | 'analyze' | 'facts' | 'confidentialKb'
   const [scenario, setScenario] = useState('auto');
   const [extractionMode, setExtractionMode] = useState('rule_only');
   const [secondaryCheck, setSecondaryCheck] = useState(false);
+  const [confidentialRawDemo, setConfidentialRawDemo] = useState(true);
+  const [confidentialCfaEvidence, setConfidentialCfaEvidence] = useState(true);
 
   // Inputs
   const [userInput, setUserInput] = useState('');
@@ -688,8 +1083,7 @@ export default function App() {
   const [error, setError] = useState('');
 
   // LLM Payload debug
-  const [llmPayload, setLlmPayload] = useState(null);
-  const [llmPayloadError, setLlmPayloadError] = useState('');
+  const [llmPayloadItems, setLlmPayloadItems] = useState([]);
 
   const handleSend = useCallback(async () => {
     if (!userInput.trim()) return;
@@ -697,8 +1091,7 @@ export default function App() {
     setLoading(true);
     setError('');
     setResult(null);
-    setLlmPayload(null);
-    setLlmPayloadError('');
+    setLlmPayloadItems([]);
 
     try {
       let data;
@@ -708,6 +1101,9 @@ export default function App() {
           scenario,
           mode: extractionMode,
           secondary_check: secondaryCheck,
+          include_confidential_raw_demo: scenario === 'confidential' && confidentialRawDemo,
+          confidential_raw_demo_mode: 'raw',
+          include_confidential_cfa_evidence: scenario === 'confidential' && confidentialCfaEvidence,
         });
       } else {
         if (!modelOutput.trim()) {
@@ -719,22 +1115,29 @@ export default function App() {
           scenario,
           mode: extractionMode,
           secondary_check: secondaryCheck,
+          include_confidential_cfa_evidence: scenario === 'confidential' && confidentialCfaEvidence,
         });
       }
       setResult(data);
 
-      // 只有对话模式会调用 LLM 生成，按当前 request_id 读取真实 payload。
-      // 保密场景不主动拉取 payload 正文，仅保留后端返回的安全元信息。
-      if (mode === 'chat' && data.routed_scenario !== 'confidential') {
-        try {
-          const primaryRef = (data.llm_debug_refs || []).find((ref) => ref.purpose === 'primary_generation');
-          const payloadData = await fetchLastLlmPayload({
-            requestId: primaryRef?.request_id || data.request_id,
-            purpose: primaryRef?.purpose || 'primary_generation',
-          });
-          setLlmPayload(payloadData);
-        } catch (e) {
-          setLlmPayloadError(e.message || '本次请求没有捕获到对应的 LLM 请求');
+      // 只有对话模式会调用 LLM 生成，按当前 request_id + purpose 读取真实 payload。
+      if (mode === 'chat') {
+        const refs = Array.isArray(data.llm_debug_refs) ? data.llm_debug_refs : [];
+        const sortedRefs = [...refs].sort((a, b) => (a.stage || 99) - (b.stage || 99));
+        if (sortedRefs.length > 0) {
+          const settled = await Promise.allSettled(
+            sortedRefs.map((ref) => fetchLastLlmPayload({
+              requestId: ref.request_id || data.request_id,
+              purpose: ref.purpose || 'primary_generation',
+            }))
+          );
+          setLlmPayloadItems(sortedRefs.map((ref, idx) => ({
+            ref,
+            payload: settled[idx].status === 'fulfilled' ? settled[idx].value : null,
+            error: settled[idx].status === 'rejected'
+              ? (settled[idx].reason?.message || '本阶段没有捕获到对应的 LLM 请求')
+              : '',
+          })));
         }
       }
     } catch (err) {
@@ -742,13 +1145,14 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [mode, userInput, modelOutput, scenario, extractionMode, secondaryCheck]);
+  }, [mode, userInput, modelOutput, scenario, extractionMode, secondaryCheck, confidentialRawDemo, confidentialCfaEvidence]);
 
   const handleClear = useCallback(() => {
     setUserInput('');
     setModelOutput('');
     setResult(null);
     setError('');
+    setLlmPayloadItems([]);
   }, []);
 
   const fillQuickChat = (text) => {
@@ -814,7 +1218,7 @@ export default function App() {
       {/* ================================================================
           Workspace
           ================================================================ */}
-      <div className="workspace">
+      <div className={`workspace ${mode === 'confidentialKb' ? 'kb-workspace' : ''}`}>
         {/* Left Panel: Input */}
         <div className="panel-left">
           {/* Tabs */}
@@ -837,11 +1241,19 @@ export default function App() {
             >
               📋 事实管理
             </div>
+            <div
+              className={`tab ${mode === 'confidentialKb' ? 'active' : ''}`}
+              onClick={() => setMode('confidentialKb')}
+            >
+              🛡️ 保密库
+            </div>
           </div>
 
           {/* Input Area */}
           {mode === 'facts' ? (
             <ProtectedFactPanel currentScenario={scenario} />
+          ) : mode === 'confidentialKb' ? (
+            <ConfidentialKbBrowser />
           ) : (
             <div className="input-area">
               <label>用户输入 / 问题</label>
@@ -868,6 +1280,29 @@ export default function App() {
                   />
                   <div className="char-count">{modelOutput.length} 字符</div>
                 </>
+              )}
+
+              {scenario === 'confidential' && (
+                <div className="demo-toggle-group">
+                  {mode === 'chat' && (
+                    <label className="demo-toggle">
+                      <input
+                        type="checkbox"
+                        checked={confidentialRawDemo}
+                        onChange={(e) => setConfidentialRawDemo(e.target.checked)}
+                      />
+                      展示 LLM 原始回答（检测前，不拦截）
+                    </label>
+                  )}
+                  <label className="demo-toggle">
+                    <input
+                      type="checkbox"
+                      checked={confidentialCfaEvidence}
+                      onChange={(e) => setConfidentialCfaEvidence(e.target.checked)}
+                    />
+                    展示 CFA 还原受限事实（本地实验对照）
+                  </label>
+                </div>
               )}
 
               <div className="btn-row">
@@ -903,8 +1338,7 @@ export default function App() {
         <div className="panel-right">
           <OutputSection loading={loading} error={error} result={result} />
           <LlmPayloadPanel
-            payload={llmPayload}
-            error={llmPayloadError}
+            items={llmPayloadItems}
             confidential={result?.routed_scenario === 'confidential'}
           />
         </div>

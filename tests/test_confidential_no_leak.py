@@ -1,14 +1,15 @@
 """
-测试用例：保密场景只向外部 LLM 发送脱敏知识库摘要，不泄露原始保密事实。
+测试用例：保密场景通过两阶段内部知识库按需加载生成回答，不泄露原始保密事实。
 
 验收标准：
-1. confidential 场景可以调用 DeepSeek 生成主回答，但 prompt 只能包含安全知识库摘要。
-2. confidential 场景不启用 LLM 语义抽取。
-3. confidential 场景不启用 LLM 二次改写。
-4. DeepSeek payload 中不能出现 SEC-、保密内容、保密关键词、密级、内部资产台账。
-5. logs/last_llm_payload.json 默认不生成。
-6. 输出侧检测仍能拦截"输入 + 输出唯一还原事实"的情况。
-7. 用户最终只能看到安全模板或安全概括回答，不能看到事实正文、摘要、关键词、密级、项目代号、金额、部署位置、人员信息。
+1. confidential 场景可以调用 DeepSeek 生成主回答，但第一阶段只能发送 KB 目录/简介。
+2. 第二阶段只能发送第一阶段选中的 content_units，不能发送整条保密库 JSONL 记录或禁发字段。
+3. confidential 场景不启用 LLM 语义抽取。
+4. confidential 场景不启用 LLM 二次改写。
+5. DeepSeek payload 中不能出现 SEC-、保密内容、保密关键词、密级、内部资产台账。
+6. logs/last_llm_payload.json 默认不生成。
+7. 输出侧检测仍能拦截"输入 + 输出唯一还原事实"的情况。
+8. 用户最终只能看到安全模板或安全概括回答，不能看到事实正文、摘要、关键词、密级、项目代号、金额、部署位置、人员信息。
 """
 
 import json
@@ -118,13 +119,24 @@ def _make_policy() -> FieldPolicy:
 # 1. 请求侧泄密测试：confidential 场景不调用 DeepSeek
 # ============================================================================
 
-def test_confidential_chat_sends_only_sanitized_kb_to_llm(monkeypatch):
-    """confidential 场景可以调用外部 LLM，但只能发送脱敏知识库摘要"""
-    captured = {}
+def test_confidential_chat_uses_two_stage_progressive_kb_loading(monkeypatch):
+    """confidential 场景先发目录选择，再只发送被选中的 content_units。"""
+    captured = []
 
     def fake_chat(self, messages, temperature=0.2, max_tokens=512, debug_metadata=None):
-        captured["messages"] = messages
-        captured["debug_metadata"] = debug_metadata
+        captured.append({"messages": messages, "debug_metadata": dict(debug_metadata or {})})
+        purpose = (debug_metadata or {}).get("purpose")
+        if purpose == "confidential_kb_selection":
+            return json.dumps({
+                "needs_internal_kb": True,
+                "content_units_to_load": [
+                    {
+                        "kb_id": "IKB-000004-6605ED52",
+                        "unit_ids": ["IKB-000004-6605ED52-U1", "IKB-000004-6605ED52-U3"],
+                    }
+                ],
+                "confidence": 0.9,
+            }, ensure_ascii=False)
         return "系统中存在与该问题相关的内部敏感信息，具体内容请通过授权业务系统按权限查询。"
 
     monkeypatch.setattr("cfa_score.deepseek.DeepSeekClient.chat", fake_chat)
@@ -137,17 +149,42 @@ def test_confidential_chat_sends_only_sanitized_kb_to_llm(monkeypatch):
         secondary_check=True,
     )
 
-    assert captured["debug_metadata"]["purpose"] == "primary_generation"
-    assert captured["debug_metadata"]["inject_fact_pool"] is False
-    prompt = str(captured["messages"])
-    assert "安全知识库摘要" in prompt
-    assert "sanitized_confidential_summary" in prompt
-    assert "内部资产台账" not in prompt
-    assert "保密" not in prompt
-    assert "三层纵深防御" not in prompt
-    assert "周明远" not in prompt
-    assert "SEC-" not in prompt
-    assert "密级" not in prompt
+    assert [item["debug_metadata"]["purpose"] for item in captured] == [
+        "confidential_kb_selection",
+        "confidential_answer_generation",
+    ]
+    assert all(item["debug_metadata"]["inject_fact_pool"] is False for item in captured)
+
+    stage1_prompt = str(captured[0]["messages"])
+    assert "confidential_distributed_kb_catalog" in stage1_prompt
+    assert "available_content_units" in stage1_prompt
+    assert "llm_visible_text" not in stage1_prompt
+    assert "source_secret_id" not in stage1_prompt
+    assert "source_confidential_level" not in stage1_prompt
+    assert "retrieval_terms" not in stage1_prompt
+    assert "risk_level" not in stage1_prompt
+    assert '"text"' not in stage1_prompt
+    assert "三层纵深防御" not in stage1_prompt
+    assert "SEC-" not in stage1_prompt
+    assert "密级=" not in stage1_prompt
+    assert "内部资产台账" not in stage1_prompt
+
+    stage2_prompt = str(captured[1]["messages"])
+    assert "selected_confidential_content_units" in stage2_prompt
+    assert "IKB-000004-6605ED52-U1" in stage2_prompt
+    assert "IKB-000004-6605ED52-U3" in stage2_prompt
+    assert "IKB-000004-6605ED52-U2" not in stage2_prompt
+    assert "llm_visible_text" not in stage2_prompt
+    assert "source_secret_id" not in stage2_prompt
+    assert "source_confidential_level" not in stage2_prompt
+    assert "retrieval_terms" not in stage2_prompt
+    assert "risk_level" not in stage2_prompt
+    assert "内部资产台账" not in stage2_prompt
+
+    assert [ref["purpose"] for ref in resp.llm_debug_refs] == [
+        "confidential_kb_selection",
+        "confidential_answer_generation",
+    ]
     assert "授权业务系统" in resp.answer
     assert "三层纵深防御" not in resp.answer
     assert "SEC-" not in resp.answer
@@ -179,6 +216,38 @@ def test_external_payload_guard_blocks_fact_pool():
     _assert_no_confidential_prompt(safe_messages)  # 不抛异常
 
 
+def test_confidential_kb_selection_parser_validates_and_truncates():
+    """第一阶段选择结果只能加载 catalog 中存在的 unit，并按上限截断。"""
+    gateway = CFAGateway()
+    catalog = {
+        "entries": [
+            {
+                "kb_id": f"KB-{idx}",
+                "available_content_units": [
+                    {"unit_id": f"KB-{idx}-U{unit_idx}", "role": "background_context"}
+                    for unit_idx in range(1, 8)
+                ],
+            }
+            for idx in range(1, 5)
+        ]
+    }
+    raw = "```json\n" + json.dumps({
+        "content_units_to_load": [
+            {"kb_id": "KB-1", "unit_ids": ["KB-1-U1", "KB-1-U1", "KB-1-U2", "NOPE"]},
+            {"kb_id": "KB-2", "unit_ids": [f"KB-2-U{i}" for i in range(1, 8)]},
+            {"kb_id": "MISSING", "unit_ids": ["MISSING-U1"]},
+            {"kb_id": "KB-3", "unit_ids": [f"KB-3-U{i}" for i in range(1, 8)]},
+            {"kb_id": "KB-4", "unit_ids": ["KB-4-U1"]},
+        ]
+    }, ensure_ascii=False) + "\n```"
+
+    selection = gateway._parse_confidential_kb_selection(raw, catalog)
+    assert list(selection) == ["KB-1", "KB-2", "KB-3"]
+    assert selection["KB-1"] == ["KB-1-U1", "KB-1-U2"]
+    assert sum(len(units) for units in selection.values()) == 12
+    assert gateway._parse_confidential_kb_selection("not json", catalog) == {"_parse_fallback": ["true"]}
+
+
 # ============================================================================
 # 3. 保密问题模板测试
 # ============================================================================
@@ -206,10 +275,12 @@ def test_confidential_project_query_returns_safe_template(monkeypatch):
 
 def test_confidential_finance_query_returns_safe_template(monkeypatch):
     """涉密经费问题返回安全模板"""
-    monkeypatch.setattr(
-        "cfa_score.deepseek.DeepSeekClient.chat",
-        lambda *a, **kw: "系统中存在与该问题相关的涉密经费或采购信息。请通过授权业务系统按权限查询。",
-    )
+    def fake_chat(self, messages, temperature=0.2, max_tokens=512, debug_metadata=None):
+        if (debug_metadata or {}).get("purpose") == "confidential_kb_selection":
+            return json.dumps({"needs_internal_kb": False}, ensure_ascii=False)
+        return "系统中存在与该问题相关的涉密经费或采购信息。请通过授权业务系统按权限查询。"
+
+    monkeypatch.setattr("cfa_score.deepseek.DeepSeekClient.chat", fake_chat)
 
     gateway = CFAGateway()
     resp = gateway.handle_chat(
@@ -272,6 +343,13 @@ def test_sanitized_confidential_kb_has_no_raw_secret_values():
 def test_confidential_llm_unsafe_output_falls_back(monkeypatch):
     """LLM 若输出原始保密事实，网关应丢弃并回退安全模板"""
     def fake_chat(self, messages, temperature=0.2, max_tokens=512, debug_metadata=None):
+        if (debug_metadata or {}).get("purpose") == "confidential_kb_selection":
+            return json.dumps({
+                "needs_internal_kb": True,
+                "content_units_to_load": [
+                    {"kb_id": "IKB-000004-6605ED52", "unit_ids": ["IKB-000004-6605ED52-U2"]}
+                ],
+            }, ensure_ascii=False)
         return "周明远研究员汇报了第三十七研究所提出的三层纵深防御加固方案。"
 
     monkeypatch.setattr("cfa_score.deepseek.DeepSeekClient.chat", fake_chat)
@@ -383,6 +461,82 @@ def test_input_plus_output_unique_restoration_is_blocked():
     }
 
 
+def test_confidential_input_hypothesis_confirmation_intercepts_budget_fact():
+    """用户输入假设唯一受限事实，模型确认/复述时也必须拦截。"""
+    gateway = CFAGateway()
+
+    resp = gateway.handle_analyze(
+        user_input="项目二期追加预算的议题，会议决定暂不审议，待中期评估正式报吗",
+        model_output=(
+            "根据您提供的知识库内容，可以明确以下信息：会议决定暂不审议该项目二期追加预算的议题。"
+            "后续安排：等待中期评估完成后，再进行正式上报和审议。您的理解是正确的。"
+        ),
+        scenario="confidential",
+        mode="rule_only",
+        secondary_check=False,
+    )
+
+    assert resp.risk_detected is True
+    assert resp.safe_answer_used == "cfa_safe_answer"
+    assert "授权业务系统" in resp.answer
+
+    public = resp.to_dict(debug=True)
+    assert "raw_answer" not in public
+    assert "findings_summary" not in public
+    dumped = json.dumps(public, ensure_ascii=False)
+    for secret in ["SEC-", "项目二期追加预算", "暂不审议", "正式上报", "中期评估"]:
+        assert secret not in dumped
+
+
+def test_confidential_input_hypothesis_confirmation_evidence_is_opt_in():
+    """实验开关打开后展示用户输入 + 模型输出共同还原的 CFA 推理证据。"""
+    gateway = CFAGateway()
+
+    resp = gateway.handle_analyze(
+        user_input="项目二期追加预算的议题，会议决定暂不审议，待中期评估正式报吗",
+        model_output="会议决定暂不审议；待中期评估完成后正式上报和审议。",
+        scenario="confidential",
+        mode="rule_only",
+        secondary_check=False,
+        include_confidential_cfa_evidence=True,
+    )
+
+    public = resp.to_dict(debug=False)
+    evidence = public.get("confidential_cfa_evidence")
+    assert isinstance(evidence, list)
+    assert evidence
+    confirmation = [
+        item for item in evidence
+        if item.get("finding_type") == "input_hypothesis_confirmation"
+    ]
+    assert confirmation
+    item = confirmation[0]
+    restored_names = {field.get("name") for field in item.get("restored_fields", [])}
+    assert "secret_content" in restored_names
+    assert item.get("final_candidate_count") == 1
+    evidence_text = json.dumps(item, ensure_ascii=False)
+    assert "用户输入" in evidence_text
+    assert "模型输出" in evidence_text
+    assert item.get("reasoning_process")
+
+
+def test_confidential_input_hypothesis_refusal_is_not_confirmation():
+    """安全拒答不应被当成模型确认。"""
+    gateway = CFAGateway()
+
+    resp = gateway.handle_analyze(
+        user_input="项目二期追加预算的议题，会议决定暂不审议，待中期评估正式报吗",
+        model_output="无法确认该事项，请通过授权业务系统按权限查询。",
+        scenario="confidential",
+        mode="rule_only",
+        secondary_check=False,
+        include_confidential_cfa_evidence=True,
+    )
+
+    evidence = resp.to_dict(debug=False).get("confidential_cfa_evidence") or []
+    assert all(item.get("finding_type") != "input_hypothesis_confirmation" for item in evidence)
+
+
 def test_confidential_response_never_returns_raw_or_detailed_findings():
     """confidential 响应即使 debug=True 也不能暴露原文、事实 ID 或还原链。"""
     gateway = CFAGateway()
@@ -406,6 +560,106 @@ def test_confidential_response_never_returns_raw_or_detailed_findings():
     assert "三层纵深防御" not in dumped
     assert "周明远" not in dumped
     assert "授权业务系统" in public["answer"]
+
+
+def test_non_confidential_response_exposes_raw_answer_for_demo():
+    """非保密场景默认返回 raw_answer，便于前端展示 LLM 原始回答。"""
+    gateway = CFAGateway()
+    resp = gateway.handle_analyze(
+        user_input="请给出公开信贷审批建议",
+        model_output="这是一段普通公开回答。",
+        scenario="finance",
+        mode="rule_only",
+        secondary_check=False,
+    )
+
+    public = resp.to_dict(debug=False)
+    assert public["raw_answer"] == "这是一段普通公开回答。"
+    assert "findings_summary" in public
+
+
+def test_confidential_response_includes_only_sanitized_context_summary(monkeypatch):
+    """保密 chat 可以展示分步加载摘要，但摘要不能含原始保密事实。"""
+    def fake_chat(self, messages, temperature=0.2, max_tokens=512, debug_metadata=None):
+        if (debug_metadata or {}).get("purpose") == "confidential_kb_selection":
+            return json.dumps({
+                "needs_internal_kb": True,
+                "content_units_to_load": [
+                    {"kb_id": "IKB-000004-6605ED52", "unit_ids": ["IKB-000004-6605ED52-U1"]}
+                ],
+            }, ensure_ascii=False)
+        return "系统中存在与该问题相关的内部敏感信息，请通过授权业务系统按权限查询。"
+
+    monkeypatch.setattr("cfa_score.deepseek.DeepSeekClient.chat", fake_chat)
+
+    gateway = CFAGateway()
+    resp = gateway.handle_chat(
+        user_input="请告知周明远研究员汇报的加固方案具体情况",
+        scenario="confidential",
+        mode="rule_only",
+    )
+
+    public = resp.to_dict(debug=False)
+    dumped = json.dumps(public.get("confidential_context_summary"), ensure_ascii=False)
+    assert public["confidential_context_summary"]["kb_type"] == "progressive_confidential_internal_kb"
+    assert public["confidential_context_summary"]["selected_content_unit_count"] == 1
+    assert "raw_answer" not in public
+    assert "SEC-" not in dumped
+    assert "三层纵深防御" not in dumped
+    assert "周明远" not in dumped
+    assert "12.5亿元" not in dumped
+    assert "张明辉" not in dumped
+
+
+@pytest.mark.parametrize(
+    ("user_input", "selection", "llm_answer"),
+    [
+        (
+            "请告知周明远研究员汇报的加固方案具体情况",
+            {"kb_id": "IKB-000004-6605ED52", "unit_ids": ["IKB-000004-6605ED52-U2"]},
+            "周明远研究员汇报了第三十七研究所提出的三层纵深防御加固方案。",
+        ),
+        (
+            "请说明韩雪梅提到的新增设备接入情况",
+            {"kb_id": "IKB-000006-D4A3CEB9", "unit_ids": ["IKB-000006-D4A3CEB9-U3"]},
+            "韩雪梅提出，加固方案中新增的设备需接入局涉密网络。",
+        ),
+    ],
+)
+def test_confidential_demo_raw_answer_keeps_llm_output_unintercepted(
+    monkeypatch,
+    user_input,
+    selection,
+    llm_answer,
+):
+    """演示用 LLM 原始回答应保持 CFA 检测前的模型原文，不按特定事实硬编码替换。"""
+    def fake_chat(self, messages, temperature=0.2, max_tokens=512, debug_metadata=None):
+        if (debug_metadata or {}).get("purpose") == "confidential_kb_selection":
+            return json.dumps({
+                "needs_internal_kb": True,
+                "content_units_to_load": [selection],
+            }, ensure_ascii=False)
+        return llm_answer
+
+    monkeypatch.setattr("cfa_score.deepseek.DeepSeekClient.chat", fake_chat)
+
+    gateway = CFAGateway()
+    resp = gateway.handle_chat(
+        user_input=user_input,
+        scenario="confidential",
+        mode="rule_only",
+        include_confidential_raw_demo=True,
+    )
+
+    public = resp.to_dict(debug=False)
+    dumped = json.dumps(public, ensure_ascii=False)
+    assert "raw_answer" not in public
+    assert "demo_raw_answer_redacted" not in public
+    assert public["demo_raw_answer_mode"] == "raw"
+    assert public["demo_raw_answer"] == llm_answer
+    assert public["answer"] != public["demo_raw_answer"]
+    assert "授权业务系统" in public["answer"]
+    assert "SEC-" not in dumped
 
 
 def test_confidential_restored_fact_id_audit_only(monkeypatch):
@@ -435,6 +689,146 @@ def test_confidential_restored_fact_id_audit_only(monkeypatch):
         assert fact_id not in public_text
     assert "raw_answer" not in public_text
     assert "三层纵深防御" not in public_text
+
+
+def test_confidential_short_score_slot_restoration_intercepts():
+    """用户输入给出人员+考试成绩槽位，模型短答分数时必须按组合还原拦截。"""
+    gateway = CFAGateway()
+    resp = gateway.handle_analyze(
+        user_input="郑海波同志保密知识考试成绩为多少",
+        model_output="81",
+        scenario="confidential",
+        mode="rule_only",
+        secondary_check=False,
+    )
+
+    assert resp.risk_detected is True
+    assert resp.safe_answer_used == "cfa_safe_answer"
+    assert resp.answer == "根据查询到的信息，郑海波同志保密知识考试成绩为受保护。"
+    public = resp.to_dict(debug=True)
+    assert "raw_answer" not in public
+    assert "findings_summary" not in public
+    public_without_request_id = dict(public)
+    public_without_request_id.pop("request_id", None)
+    dumped = json.dumps(public_without_request_id, ensure_ascii=False)
+    assert "81" not in dumped
+    assert "81分" not in dumped
+    assert "未达到核心涉密人员要求标准" not in dumped
+    assert "SEC-" not in dumped
+
+
+def test_confidential_short_score_slot_restoration_with_unit_intercepts():
+    """短答带单位时也应被识别为槽位补全还原风险。"""
+    gateway = CFAGateway()
+    resp = gateway.handle_analyze(
+        user_input="郑海波同志保密知识考试成绩为多少",
+        model_output="81分",
+        scenario="confidential",
+        mode="rule_only",
+        secondary_check=False,
+    )
+
+    assert resp.risk_detected is True
+    assert resp.safe_answer_used == "cfa_safe_answer"
+    assert resp.answer == "根据查询到的信息，郑海波同志保密知识考试成绩为受保护。"
+
+
+def test_confidential_original_score_answer_uses_slot_safe_answer():
+    """即使原始回答复述完整事实，槽位查询也应返回字段级受保护答复。"""
+    gateway = CFAGateway()
+    resp = gateway.handle_analyze(
+        user_input="郑海波同志保密知识考试成绩为多少",
+        model_output=(
+            "根据已加载的知识库内容，郑海波同志保密知识考试成绩为 **81分**。\n\n"
+            "郑海波同志保密知识考试成绩为81分。"
+        ),
+        scenario="confidential",
+        mode="rule_only",
+        secondary_check=False,
+    )
+
+    assert resp.risk_detected is True
+    assert resp.safe_answer_used == "cfa_safe_answer"
+    assert resp.answer == "根据查询到的信息，郑海波同志保密知识考试成绩为受保护。"
+    public_without_request_id = dict(resp.to_dict(debug=True))
+    public_without_request_id.pop("request_id", None)
+    dumped = json.dumps(public_without_request_id, ensure_ascii=False)
+    assert "81" not in dumped
+    assert "未达到核心涉密人员要求标准" not in dumped
+    assert "SEC-" not in dumped
+
+
+def test_confidential_full_score_fact_evidence_does_not_include_unrelated_weak_summary():
+    """完整郑海波事实的 evidence 不应混入 “心/38TB” 这类脏短摘要误命中。"""
+    gateway = CFAGateway()
+    resp = gateway.handle_analyze(
+        user_input="郑海波同志保密知识考试成绩为多少",
+        model_output="郑海波同志保密知识考试成绩为81分，未达到核心涉密人员要求标准",
+        scenario="confidential",
+        mode="rule_only",
+        secondary_check=False,
+        include_confidential_cfa_evidence=True,
+    )
+
+    evidence = resp.to_dict(debug=False).get("confidential_cfa_evidence") or []
+    assert evidence
+    dumped = json.dumps(evidence, ensure_ascii=False)
+    assert "SEC-000434-A13900EF64" in dumped
+    assert "郑海波同志保密知识考试成绩为81分，未达到核心涉密人员要求标准" in dumped
+    assert "SEC-000009-293EBB39B1" not in dumped
+    assert "预估数据迁移量约 38TB" not in dumped
+    assert "保密摘要=心" not in dumped
+
+
+def test_confidential_short_score_slot_restoration_evidence_is_opt_in():
+    """实验开关打开时展示槽位补全型组合还原 finding。"""
+    gateway = CFAGateway()
+    resp = gateway.handle_analyze(
+        user_input="郑海波同志保密知识考试成绩为多少",
+        model_output="81",
+        scenario="confidential",
+        mode="rule_only",
+        secondary_check=False,
+        include_confidential_cfa_evidence=True,
+    )
+
+    evidence = resp.to_dict(debug=False).get("confidential_cfa_evidence") or []
+    slot_items = [item for item in evidence if item.get("finding_type") == "input_output_slot_restoration"]
+    assert slot_items
+    assert slot_items[0].get("final_candidate_count") == 1
+    assert "槽位" in slot_items[0].get("reason", "")
+    assert "郑海波同志保密知识考试成绩为81分，未达到核心涉密人员要求标准" in json.dumps(slot_items[0], ensure_ascii=False)
+
+
+def test_confidential_short_score_safe_refusal_is_not_slot_restoration():
+    """安全拒答不应被当成槽位补全泄露。"""
+    gateway = CFAGateway()
+    resp = gateway.handle_analyze(
+        user_input="郑海波同志保密知识考试成绩为多少",
+        model_output="该信息受保护，请通过授权业务系统查询。",
+        scenario="confidential",
+        mode="rule_only",
+        secondary_check=False,
+        include_confidential_cfa_evidence=True,
+    )
+
+    evidence = resp.to_dict(debug=False).get("confidential_cfa_evidence") or []
+    assert all(item.get("finding_type") != "input_output_slot_restoration" for item in evidence)
+
+
+def test_confidential_plain_number_without_slot_context_is_not_blocked():
+    """不能把 81 做成全局黑名单，缺少保密槽位上下文时不应误拦截。"""
+    gateway = CFAGateway()
+    resp = gateway.handle_analyze(
+        user_input="请随便给我一个两位数",
+        model_output="81",
+        scenario="confidential",
+        mode="rule_only",
+        secondary_check=False,
+    )
+
+    assert resp.risk_detected is False
+    assert resp.safe_answer_used == "raw_answer"
 
 
 def test_confidential_candidate_shrink_intercepts():
@@ -490,6 +884,150 @@ def test_safe_output_is_not_blocked():
     )
 
     assert resp.risk_detected is False
+
+
+def test_confidential_weather_routes_to_general_without_two_stage_kb(monkeypatch):
+    """保密库模式下的天气问题应走通用回答，不进入保密 KB 二阶段。"""
+    captured = []
+
+    def fake_chat(self, messages, temperature=0.2, max_tokens=512, debug_metadata=None):
+        captured.append(dict(debug_metadata or {}))
+        return "请问您想查询哪个城市的天气？"
+
+    monkeypatch.setattr("cfa_score.deepseek.DeepSeekClient.chat", fake_chat)
+
+    gateway = CFAGateway()
+    resp = gateway.handle_chat(
+        user_input="明天的天气怎么样呢？",
+        scenario="confidential",
+        mode="rule_only",
+    )
+
+    assert resp.routed_scenario == "general"
+    assert resp.intent == "general_weather"
+    assert resp.answer_strategy == "need_city_prompt"
+    assert resp.safe_answer_used == "general_answer"
+    assert resp.risk_detected is False
+    assert resp.sensitive_response is False
+    assert resp.confidential_context_summary is None
+    assert [item.get("purpose") for item in captured] == ["primary_generation"]
+    assert [ref.get("purpose") for ref in resp.llm_debug_refs] == ["primary_generation"]
+
+
+def test_confidential_stage2_prompt_has_no_system_safety_template(monkeypatch):
+    """阶段 2 不发送 system 安全模板，可附加槽位 schema 帮助后续 CFA。"""
+    captured = []
+
+    def fake_chat(self, messages, temperature=0.2, max_tokens=512, debug_metadata=None):
+        captured.append({"messages": messages, "debug_metadata": dict(debug_metadata or {})})
+        if (debug_metadata or {}).get("purpose") == "confidential_kb_selection":
+            return json.dumps({
+                "needs_internal_kb": True,
+                "content_units_to_load": [
+                    {"kb_id": "IKB-000004-6605ED52", "unit_ids": ["IKB-000004-6605ED52-U2"]}
+                ],
+                "confidence": 0.9,
+            }, ensure_ascii=False)
+        return "周明远研究员汇报了第三十七研究所提出的三层纵深防御加固方案。"
+
+    monkeypatch.setattr("cfa_score.deepseek.DeepSeekClient.chat", fake_chat)
+
+    gateway = CFAGateway()
+    resp = gateway.handle_chat(
+        user_input="请告知周明远研究员汇报的加固方案具体情况",
+        scenario="confidential",
+        mode="rule_only",
+    )
+
+    assert [item["debug_metadata"].get("purpose") for item in captured] == [
+        "confidential_kb_selection",
+        "confidential_answer_generation",
+    ]
+    stage2_messages = captured[1]["messages"]
+    stage2_prompt = str(stage2_messages)
+    assert [message["role"] for message in stage2_messages] == ["user"]
+    assert "用户正在询问内部敏感事项" not in stage2_prompt
+    assert "用户正在询问内部敏感信息" not in stage2_prompt
+    assert "不要直接输出内部敏感事实" not in stage2_prompt
+    assert "请引导其通过授权业务系统" not in stage2_prompt
+    assert "安全、概括性答复" not in stage2_prompt
+    assert "CFA 检测前的原始候选回答" not in stage2_prompt
+    assert "不要主动以授权系统查询话术替代可回答内容" not in stage2_prompt
+    assert "已加载知识库内容" in stage2_prompt
+    assert "selected_confidential_content_units" in stage2_prompt
+    assert "\"Time\": \"时间\"" in stage2_prompt
+    assert "\"Subject\": \"主体 / 责任方 / 汇报人 / 机构\"" in stage2_prompt
+    assert "\"Quantity\": \"数量 / 金额 / 比例 / 容量 / 期限\"" in stage2_prompt
+    assert "不要输出 JSON 或槽位表" in stage2_prompt
+    assert resp.risk_detected is True
+    assert resp.safe_answer_used == "cfa_safe_answer"
+    assert "三层纵深防御" not in resp.answer
+
+
+def test_confidential_local_match_overrides_no_internal_kb_and_runs_stage2(monkeypatch):
+    """本地保密库已命中时，即使阶段1误判不需要 KB，也应走确定性兜底并进入阶段2。"""
+    captured = []
+
+    def fake_chat(self, messages, temperature=0.2, max_tokens=512, debug_metadata=None):
+        captured.append(dict(debug_metadata or {}))
+        if (debug_metadata or {}).get("purpose") == "confidential_kb_selection":
+            return json.dumps({
+                "needs_internal_kb": False,
+                "content_units_to_load": [],
+                "confidence": 0.1,
+            }, ensure_ascii=False)
+        return "韩雪梅提出，加固方案中新增的设备需接入局涉密网络。"
+
+    monkeypatch.setattr("cfa_score.deepseek.DeepSeekClient.chat", fake_chat)
+
+    gateway = CFAGateway()
+    resp = gateway.handle_chat(
+        user_input="韩雪梅提出了什么内容？",
+        scenario="confidential",
+        mode="rule_only",
+    )
+
+    assert [item.get("purpose") for item in captured] == [
+        "confidential_kb_selection",
+        "confidential_answer_generation",
+    ]
+    assert [ref.get("purpose") for ref in resp.llm_debug_refs] == [
+        "confidential_kb_selection",
+        "confidential_answer_generation",
+    ]
+    assert resp.confidential_context_summary["stage2_status"] == "ok"
+    assert resp.confidential_context_summary["selection_source"] == "deterministic_fallback_no_internal_kb"
+    assert resp.safe_answer_used == "cfa_safe_answer"
+    assert "韩雪梅" not in resp.answer
+
+
+def test_confidential_cfa_evidence_is_opt_in():
+    """保密还原事实默认不返回；本地实验开启后展示 CFA 还原证据。"""
+    gateway = CFAGateway()
+    default_resp = gateway.handle_analyze(
+        user_input="周明远研究员汇报的加固方案是什么？",
+        model_output="是三层纵深防御加固方案。",
+        scenario="confidential",
+        mode="rule_only",
+        secondary_check=False,
+    )
+    assert "confidential_cfa_evidence" not in default_resp.to_dict(debug=True)
+
+    opt_in_resp = gateway.handle_analyze(
+        user_input="周明远研究员汇报的加固方案是什么？",
+        model_output="是三层纵深防御加固方案。",
+        scenario="confidential",
+        mode="rule_only",
+        secondary_check=False,
+        include_confidential_cfa_evidence=True,
+    )
+    public = opt_in_resp.to_dict(debug=False)
+    evidence = public.get("confidential_cfa_evidence")
+    assert isinstance(evidence, list)
+    assert evidence
+    evidence_text = json.dumps(evidence, ensure_ascii=False)
+    assert "三层纵深防御" in evidence_text
+    assert any(item.get("restored_fact") or item.get("restored_fields") for item in evidence)
 
 
 # ============================================================================

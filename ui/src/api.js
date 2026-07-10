@@ -3,7 +3,15 @@
 const BASE = '/api';
 
 /** POST /api/cfa-chat */
-export async function cfaChat({ user_input, scenario, mode, secondary_check }) {
+export async function cfaChat({
+  user_input,
+  scenario,
+  mode,
+  secondary_check,
+  include_confidential_raw_demo,
+  confidential_raw_demo_mode,
+  include_confidential_cfa_evidence,
+}) {
   const res = await fetch(`${BASE}/cfa-chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -12,6 +20,9 @@ export async function cfaChat({ user_input, scenario, mode, secondary_check }) {
       scenario: scenario || 'auto',
       mode: mode || 'rule_only',
       secondary_check: secondary_check || false,
+      include_confidential_raw_demo: Boolean(include_confidential_raw_demo),
+      confidential_raw_demo_mode: confidential_raw_demo_mode || 'raw',
+      include_confidential_cfa_evidence: Boolean(include_confidential_cfa_evidence),
     }),
   });
   if (!res.ok) {
@@ -22,7 +33,14 @@ export async function cfaChat({ user_input, scenario, mode, secondary_check }) {
 }
 
 /** POST /api/cfa-analyze */
-export async function cfaAnalyze({ user_input, model_output, scenario, mode, secondary_check }) {
+export async function cfaAnalyze({
+  user_input,
+  model_output,
+  scenario,
+  mode,
+  secondary_check,
+  include_confidential_cfa_evidence,
+}) {
   const res = await fetch(`${BASE}/cfa-analyze`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -32,6 +50,7 @@ export async function cfaAnalyze({ user_input, model_output, scenario, mode, sec
       scenario: scenario || 'healthcare',
       mode: mode || 'rule_only',
       secondary_check: secondary_check || false,
+      include_confidential_cfa_evidence: Boolean(include_confidential_cfa_evidence),
     }),
   });
   if (!res.ok) {

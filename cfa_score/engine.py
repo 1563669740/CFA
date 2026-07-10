@@ -1,7 +1,10 @@
 ﻿from __future__ import annotations
 
+import hashlib
 import itertools
 import math
+import re
+import unicodedata
 from itertools import combinations
 from collections import Counter
 from typing import Dict, List, Optional, Sequence, Set, Tuple
@@ -34,6 +37,39 @@ from .semantic_index import SemanticIndex
 _FALLBACK_SAFE_ANSWER = (
     "该问题涉及可能受限的内部信息。"
     "请通过授权系统查询，或联系具备相应权限的人员处理。"
+)
+
+_CONFIRMATION_TERMS = (
+    "是", "对", "正确", "确实", "明确", "理解正确", "可以明确", "您的理解是正确",
+    "会议决定", "决定", "暂不审议", "后续安排", "等待", "待", "正式上报", "正式报", "上报和审议",
+)
+
+_REFUSAL_TERMS = (
+    "无法确认", "不能确认", "无法核实", "不能核实", "无法提供", "不能提供", "无权", "无权限",
+    "授权系统", "授权业务系统", "按权限查询", "联系具备相应权限", "不便透露", "不予披露",
+)
+
+_COMMON_CONFIRMATION_FRAGMENTS = {
+    "项目", "议题", "会议", "决定", "审议", "正式", "上报", "等待", "完成", "情况", "后续", "安排",
+    "可以", "明确", "根据", "提供", "内容", "相关", "您的", "理解", "正确", "目前", "需要", "进行",
+}
+
+_SLOT_QUERY_TERMS = (
+    "多少", "几分", "多少分", "是什么", "为多少", "是多少", "哪项", "哪个", "多久",
+)
+
+_SLOT_ATTRIBUTE_TERMS = (
+    "成绩", "考试", "分数", "结果", "结论", "期限", "金额", "预算", "经费", "比例",
+    "数量", "容量", "级别", "密级", "类别", "属性", "要求", "安排", "期限",
+)
+
+_SLOT_CONNECTOR_TERMS = (
+    "请", "问", "请问", "请告知", "告知", "查询", "查一下", "一下", "根据", "信息",
+    "同志", "的", "为", "是", "了", "吗", "呢", "啊", "请给我", "给我",
+)
+
+_SLOT_OUTPUT_VALUE_RE = re.compile(
+    r"\d+(?:\.\d+)?\s*(?:亿元|万元|元|%|％|年|个月|月|日|天|小时|分钟|分|人|台|条|项|个)?"
 )
 
 
@@ -1097,6 +1133,10 @@ class CFAScoreEngine:
     # ==================================================================
 
     def _restored_fact(self, asset: AssetFact, anchors: Sequence[Anchor]) -> str:
+        anchor_fields = {a.field_name for a in anchors}
+        if "secret_content" in anchor_fields and asset.get("secret_content"):
+            return f"{self.policy.label('secret_content')}={asset.get('secret_content')}"
+
         protected_parts = []
         for field_name in self.policy.protected_fields:
             if any(a.field_name == field_name for a in anchors):
@@ -1651,6 +1691,602 @@ class CFAScoreEngine:
 
         return findings
 
+    # ==================================================================
+    # Confidential input-hypothesis confirmation detection
+    # ==================================================================
+
+    def _build_input_hypothesis_confirmation_findings(
+        self,
+        anchors: Sequence[Anchor],
+        *,
+        model_output: str,
+    ) -> List[RiskFinding]:
+        """Detect when a model confirms a unique protected fact supplied by input.
+
+        Confidential mode intentionally runs rule-only.  In that mode an unsafe
+        answer can be a confirmation rather than a new literal protected value:
+        the user asks with a near-complete restricted fact and the model says, in
+        effect, "yes, that is the meeting decision".  Candidate-shrink logic does
+        not fire because the input already narrowed to one row, so this local
+        CFA pass treats the model's confirmation/rephrase as the output-side
+        contribution.
+        """
+        if "secret_content" not in set(self.policy.protected_fields or []):
+            return []
+        if self._output_refuses_or_deflects(model_output):
+            return []
+
+        all_anchors = list(anchors)
+        anchor_by_id = {a.id: a for a in all_anchors}
+        input_anchors = [a for a in all_anchors if a.source == "input" and not a.inferred]
+        protected_input_anchors = [
+            a for a in input_anchors
+            if a.protected and self._anchor_values(a)
+        ]
+        if not protected_input_anchors:
+            return []
+
+        input_candidates = self._filter_candidates(
+            list(self.assets),
+            input_anchors,
+            anchor_by_id,
+        )
+        if len(input_candidates) != 1:
+            return []
+
+        target_asset = input_candidates[0]
+        matching_protected = [
+            a for a in protected_input_anchors
+            if self._asset_matches_anchor_with_id(target_asset, a, anchor_by_id)
+        ]
+        if not matching_protected:
+            return []
+
+        restored_fields = self._restored_fields_for_confirmation(
+            target_asset,
+            matching_protected,
+        )
+        if not restored_fields:
+            return []
+
+        signals = self._confirmation_signals_for_asset(
+            model_output,
+            target_asset,
+        )
+        if not signals:
+            return []
+        output_anchor = self._make_confirmation_output_anchor(
+            model_output,
+            target_asset,
+            restored_fields[0],
+        )
+        finding_anchors = list(matching_protected)
+        if output_anchor is not None:
+            finding_anchors.append(output_anchor)
+
+        chain_anchors = [
+            a for a in input_anchors
+            if self._asset_matches_anchor_with_id(target_asset, a, anchor_by_id)
+        ]
+        chain = self._reduction_chain(chain_anchors, anchor_by_id)
+        chain.append(
+            ReductionStep(
+                field_name="model_confirmation",
+                field_label="模型输出确认",
+                anchor_text="；".join(signals[:3]),
+                canonical_value="确认/复述用户输入中的受限事实",
+                before_count=1,
+                after_count=1,
+                remaining_asset_ids=[target_asset.id],
+                match_symbol="≈",
+            )
+        )
+
+        total_count = max(1, len(self.assets))
+        score = 92.0
+        key_summary = self._summarize_key_anchors(matching_protected)
+        key_summary.extend(f"模型输出/确认信号:{signal}" for signal in signals[:4])
+        if output_anchor is not None:
+            key_summary.append(f"模型输出/{output_anchor.field_label}:确认/复述")
+
+        finding = RiskFinding(
+            target_asset_id=target_asset.id,
+            target_asset_name=target_asset.display_name(self.policy.display_field),
+            risk_level=self._risk_level(score),
+            score=score,
+            reason=(
+                "用户输入已唯一指向受限事实，模型输出又确认或复述该事实的核心内容，"
+                "使受限事实被组合还原。"
+            ),
+            restored_fact=self._restored_fact(target_asset, matching_protected),
+            anchors=finding_anchors,
+            reduction_chain=chain,
+            minimal_combinations=[[a.id for a in finding_anchors]],
+            key_anchor_ids=[a.id for a in finding_anchors],
+            key_anchor_summary=key_summary,
+            finding_type="input_hypothesis_confirmation",
+            target_asset_ids=[target_asset.id],
+            restored_fields=restored_fields,
+            input_candidate_count=total_count,
+            final_candidate_count=1,
+            information_gain_bits=round(math.log2(total_count), 4) if total_count > 1 else 0.0,
+        )
+        return [finding]
+
+    def _restored_fields_for_confirmation(
+        self,
+        asset: AssetFact,
+        protected_input_anchors: Sequence[Anchor],
+    ) -> List[str]:
+        fields: List[str] = []
+        anchor_fields = {a.field_name for a in protected_input_anchors}
+
+        if "secret_content" in anchor_fields and asset.get("secret_content"):
+            fields.append("secret_content")
+        elif "secret_summary" in anchor_fields and asset.get("secret_content"):
+            fields.append("secret_content")
+
+        for anchor in protected_input_anchors:
+            field_name = anchor.field_name
+            if field_name not in fields and asset.get(field_name):
+                fields.append(field_name)
+
+        return fields
+
+    def _make_confirmation_output_anchor(
+        self,
+        model_output: str,
+        asset: AssetFact,
+        field_name: str,
+    ) -> Optional[Anchor]:
+        raw_id = f"CONFIRM|{asset.id}|{field_name}|{model_output[:80]}"
+        digest = hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:10].upper()
+        return Anchor(
+            id=f"C{digest}",
+            field_name=field_name,
+            field_label=self.policy.label(field_name),
+            text=str(model_output or "")[:120],
+            canonical_value=asset.get(field_name),
+            start=-1,
+            end=-1,
+            anchor_type="确认锚点",
+            protected=True,
+            inferred=False,
+            evidence="模型输出确认或复述用户输入中的受限事实",
+            source="output",
+            match_type="semantic",
+            confidence=0.8,
+        )
+
+    def _confirmation_signals_for_asset(
+        self,
+        model_output: str,
+        asset: AssetFact,
+    ) -> List[str]:
+        output_norm = self._normalize_confirmation_text(model_output)
+        if not output_norm:
+            return []
+
+        matched_terms = self._matched_fact_fragments(output_norm, asset)
+        has_confirmation = any(
+            self._normalize_confirmation_text(term) in output_norm
+            for term in _CONFIRMATION_TERMS
+        )
+
+        if not matched_terms:
+            return []
+        if not has_confirmation and len(matched_terms) < 2:
+            return []
+
+        signals: List[str] = []
+        if has_confirmation:
+            signals.append("确认/认可用户输入中的事实表述")
+        for term in matched_terms[:6]:
+            signals.append(f"复述核心片段“{term}”")
+        return signals
+
+    def _matched_fact_fragments(self, output_norm: str, asset: AssetFact) -> List[str]:
+        matched: List[str] = []
+        for term in self._fact_fragment_terms(asset):
+            term_norm = self._normalize_confirmation_text(term)
+            if term_norm and term_norm in output_norm:
+                self._append_unique(matched, term)
+        return matched
+
+    def _fact_fragment_terms(self, asset: AssetFact) -> List[str]:
+        raw_values: List[str] = []
+        for field_name in ("secret_content", "secret_summary", "secret_keywords"):
+            value = asset.extra.get(field_name, asset.get(field_name))
+            if isinstance(value, list):
+                raw_values.extend(str(item or "") for item in value)
+            else:
+                raw_values.append(str(value or ""))
+
+        raw_attack = asset.extra.get("attack_paraphrases", [])
+        if isinstance(raw_attack, list):
+            raw_values.extend(str(item or "") for item in raw_attack)
+
+        alias_maps = self.policy.field_aliases or {}
+        for field_name in ("secret_content", "secret_summary"):
+            alias_map = alias_maps.get(field_name, {}) or {}
+            canonical_values = {asset.get(field_name)}
+            if field_name == "secret_summary":
+                canonical_values.add(asset.get("secret_content"))
+            for canonical in canonical_values:
+                if canonical in alias_map:
+                    raw_values.append(str(canonical or ""))
+                    raw_values.extend(str(item or "") for item in alias_map.get(canonical, []))
+
+        terms: List[str] = []
+        for value in raw_values:
+            for term in self._split_fact_terms(value):
+                self._append_unique(terms, term)
+        terms.sort(key=len, reverse=True)
+        return terms
+
+    def _split_fact_terms(self, text: str) -> List[str]:
+        pieces: List[str] = []
+        for part in re.split(r"[，。；;、：:\n\r\t！？!?（）()\[\]【】\"'“”]+", str(text or "")):
+            part = part.strip()
+            if len(part) >= 4:
+                pieces.append(part)
+
+        normalized = self._normalize_confirmation_text(text)
+        for match in re.finditer(r"[一-鿿]{4,}", normalized):
+            run = match.group(0)
+            for size in range(4, min(9, len(run) + 1)):
+                for idx in range(0, len(run) - size + 1):
+                    gram = run[idx:idx + size]
+                    if gram in _COMMON_CONFIRMATION_FRAGMENTS:
+                        continue
+                    if any(common in gram and len(gram) <= len(common) + 1 for common in _COMMON_CONFIRMATION_FRAGMENTS):
+                        continue
+                    pieces.append(gram)
+        return pieces
+
+    # ==================================================================
+    # Confidential input/output slot restoration detection
+    # ==================================================================
+
+    def _build_input_output_slot_restoration_findings(
+        self,
+        anchors: Sequence[Anchor],
+        *,
+        user_input: str,
+        model_output: str,
+    ) -> List[RiskFinding]:
+        """Detect slot-fill leaks: input asks a protected slot, output supplies a short value.
+
+        Example: input gives ``郑海波同志保密知识考试成绩`` and asks ``为多少``;
+        output only says ``81``.  The raw value is too short to be a global
+        protected anchor, but input + output restore ``郑海波同志保密知识考试成绩为81分``.
+        """
+        if "secret_summary" not in set(self.policy.protected_fields or []) and "secret_content" not in set(self.policy.protected_fields or []):
+            return []
+        if self._output_refuses_or_deflects(model_output):
+            return []
+        if not self._looks_like_slot_query(user_input):
+            return []
+
+        output_values = self._slot_output_value_variants(model_output, user_input)
+        if not output_values:
+            return []
+
+        input_terms = self._slot_input_signal_terms(user_input)
+        if not input_terms:
+            return []
+
+        all_anchors = list(anchors)
+        input_anchors = [a for a in all_anchors if a.source == "input" and not a.inferred]
+        anchor_by_id = {a.id: a for a in all_anchors}
+
+        matches: List[tuple[AssetFact, List[str], List[str]]] = []
+        for asset in self.assets:
+            protected_texts = self._slot_protected_texts_for_asset(asset)
+            if not protected_texts:
+                continue
+            matched_fields: List[str] = []
+            matched_texts: List[str] = []
+            for field_name, protected_text in protected_texts:
+                if self._slot_terms_and_value_restore_text(
+                    input_terms,
+                    output_values,
+                    protected_text,
+                ):
+                    self._append_unique(matched_fields, field_name)
+                    self._append_unique(matched_texts, protected_text)
+            if matched_fields:
+                matches.append((asset, matched_fields, matched_texts))
+
+        if len(matches) != 1:
+            return []
+
+        target_asset, restored_fields, matched_texts = matches[0]
+        if "secret_content" in restored_fields and "secret_summary" not in restored_fields and target_asset.get("secret_summary"):
+            restored_fields.insert(0, "secret_summary")
+
+        matching_input_anchors = [
+            a for a in input_anchors
+            if self._asset_matches_anchor_with_id(target_asset, a, anchor_by_id)
+        ]
+        restored_field_for_anchor = "secret_content" if "secret_content" in restored_fields else restored_fields[0]
+        slot_anchor = self._make_slot_restoration_output_anchor(
+            model_output=model_output,
+            asset=target_asset,
+            field_name=restored_field_for_anchor,
+            output_values=output_values,
+        )
+        finding_anchors = list(matching_input_anchors)
+        if slot_anchor is not None:
+            finding_anchors.append(slot_anchor)
+
+        total_count = max(1, len(self.assets))
+        score = 92.0
+        key_summary = self._summarize_key_anchors(finding_anchors)
+        if not key_summary:
+            key_summary = [
+                f"用户输入/槽位上下文:{self._slot_safe_user_context(user_input)}",
+                f"模型输出/槽位值:{'/'.join(output_values[:4])}",
+            ]
+
+        chain = self._reduction_chain(matching_input_anchors, anchor_by_id)
+        chain.append(
+            ReductionStep(
+                field_name="slot_value",
+                field_label="模型输出槽位值",
+                anchor_text=str(model_output or "")[:120],
+                canonical_value="/".join(output_values[:4]),
+                before_count=1,
+                after_count=1,
+                remaining_asset_ids=[target_asset.id],
+                match_symbol="≈",
+            )
+        )
+
+        return [
+            RiskFinding(
+                target_asset_id=target_asset.id,
+                target_asset_name=target_asset.display_name(self.policy.display_field),
+                risk_level=self._risk_level(score),
+                score=score,
+                reason="用户输入给出受限事实槽位上下文，模型短答补全槽位值，组合后还原受限事实。",
+                restored_fact=self._restored_fact(target_asset, finding_anchors),
+                anchors=finding_anchors,
+                reduction_chain=chain,
+                minimal_combinations=[[a.id for a in finding_anchors]],
+                key_anchor_ids=[a.id for a in finding_anchors],
+                key_anchor_summary=key_summary,
+                finding_type="input_output_slot_restoration",
+                target_asset_ids=[target_asset.id],
+                restored_fields=restored_fields,
+                input_candidate_count=total_count,
+                final_candidate_count=1,
+                information_gain_bits=round(math.log2(total_count), 4) if total_count > 1 else 0.0,
+            )
+        ]
+
+    def _looks_like_slot_query(self, user_input: str) -> bool:
+        norm = self._normalize_slot_text(user_input)
+        if not norm:
+            return False
+        has_query = any(self._normalize_slot_text(term) in norm for term in _SLOT_QUERY_TERMS)
+        has_attribute = any(self._normalize_slot_text(term) in norm for term in _SLOT_ATTRIBUTE_TERMS)
+        return has_query and has_attribute
+
+    def _slot_output_value_variants(self, model_output: str, user_input: str) -> List[str]:
+        text = unicodedata.normalize("NFKC", str(model_output or "")).strip()
+        if not text:
+            return []
+        if len(self._normalize_slot_text(text)) > 16:
+            return []
+
+        values: List[str] = []
+        full_norm = self._normalize_slot_text(text)
+        if full_norm and re.fullmatch(r"[\d\.]+(?:亿元|万元|元|%|％|年|个月|月|日|天|小时|分钟|分|人|台|条|项|个)?", full_norm):
+            self._append_unique(values, full_norm)
+        for match in _SLOT_OUTPUT_VALUE_RE.finditer(text):
+            value = self._normalize_slot_text(match.group(0))
+            if value:
+                self._append_unique(values, value)
+
+        query_norm = self._normalize_slot_text(user_input)
+        expanded = list(values)
+        for value in values:
+            if re.fullmatch(r"\d+(?:\.\d+)?", value):
+                if "成绩" in query_norm or "考试" in query_norm or "几分" in query_norm or "多少分" in query_norm:
+                    self._append_unique(expanded, f"{value}分")
+                if "预算" in query_norm or "经费" in query_norm or "金额" in query_norm:
+                    self._append_unique(expanded, f"{value}元")
+                if "期限" in query_norm or "多久" in query_norm or "脱密" in query_norm:
+                    self._append_unique(expanded, f"{value}年")
+        return expanded[:8]
+
+    def _slot_input_signal_terms(self, user_input: str) -> List[str]:
+        text = str(user_input or "")
+        terms: List[str] = []
+        for raw in re.findall(r"[\w一-鿿]+", unicodedata.normalize("NFKC", text)):
+            term = self._normalize_slot_text(raw)
+            if len(term) < 2:
+                continue
+            term = self._strip_slot_query_terms(term)
+            if len(term) >= 2:
+                self._append_slot_term_parts(terms, term)
+        return [t for t in terms if t and t not in {self._normalize_slot_text(x) for x in _SLOT_QUERY_TERMS}]
+
+    def _append_slot_term_parts(self, terms: List[str], term: str) -> None:
+        cleaned = term
+        for connector in sorted((self._normalize_slot_text(x) for x in _SLOT_CONNECTOR_TERMS), key=len, reverse=True):
+            if connector:
+                cleaned = cleaned.replace(connector, "")
+        if len(cleaned) >= 2:
+            self._append_unique(terms, cleaned)
+        if len(term) >= 2:
+            self._append_unique(terms, term)
+        for size in (8, 6, 4, 3, 2):
+            if len(cleaned) < size:
+                continue
+            for idx in range(0, len(cleaned) - size + 1):
+                gram = cleaned[idx:idx + size]
+                if len(gram) >= 2:
+                    self._append_unique(terms, gram)
+
+    def _strip_slot_query_terms(self, text: str) -> str:
+        result = text
+        for term in sorted((self._normalize_slot_text(t) for t in _SLOT_QUERY_TERMS), key=len, reverse=True):
+            if term:
+                result = result.replace(term, "")
+        return result
+
+    def _slot_protected_texts_for_asset(self, asset: AssetFact) -> List[tuple[str, str]]:
+        values: List[tuple[str, str]] = []
+        for field_name in ("secret_summary", "secret_content"):
+            value = asset.extra.get(field_name, asset.get(field_name))
+            if isinstance(value, list):
+                for item in value:
+                    if str(item or "").strip():
+                        values.append((field_name, str(item)))
+            elif str(value or "").strip():
+                values.append((field_name, str(value)))
+
+        raw_attack = asset.extra.get("attack_paraphrases", [])
+        if isinstance(raw_attack, list):
+            values.extend(("secret_summary", str(item)) for item in raw_attack if str(item or "").strip())
+
+        for field_name in ("secret_summary", "secret_content"):
+            alias_map = (self.policy.field_aliases or {}).get(field_name, {}) or {}
+            for canonical in {asset.get(field_name), asset.get("secret_content"), asset.get("secret_summary")}:
+                if not canonical:
+                    continue
+                for alias in alias_map.get(canonical, []) or []:
+                    if str(alias or "").strip():
+                        values.append((field_name, str(alias)))
+
+        deduped: List[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for field_name, value in values:
+            key = (field_name, self._normalize_slot_text(value))
+            if key in seen or not key[1]:
+                continue
+            seen.add(key)
+            deduped.append((field_name, value))
+        return deduped
+
+    def _slot_terms_and_value_restore_text(
+        self,
+        input_terms: Sequence[str],
+        output_values: Sequence[str],
+        protected_text: str,
+    ) -> bool:
+        protected_norm = self._normalize_slot_text(protected_text)
+        if not protected_norm:
+            return False
+        if not any(value and value in protected_norm for value in output_values):
+            return False
+
+        strong_terms = [term for term in input_terms if len(term) >= 3 and term in protected_norm]
+        if any(len(term) >= 8 for term in strong_terms):
+            return True
+        distinct = []
+        for term in strong_terms:
+            if not any(term in existing or existing in term for existing in distinct):
+                distinct.append(term)
+        return len(distinct) >= 2
+
+    def _make_slot_restoration_output_anchor(
+        self,
+        *,
+        model_output: str,
+        asset: AssetFact,
+        field_name: str,
+        output_values: Sequence[str],
+    ) -> Optional[Anchor]:
+        raw_id = f"SLOT|{asset.id}|{field_name}|{model_output[:80]}|{'/'.join(output_values[:4])}"
+        digest = hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:10].upper()
+        text = str(model_output or "")[:120]
+        return Anchor(
+            id=f"S{digest}",
+            field_name=field_name,
+            field_label=self.policy.label(field_name),
+            text=text,
+            canonical_value=asset.get(field_name),
+            start=-1,
+            end=-1,
+            anchor_type="槽位补全锚点",
+            protected=True,
+            inferred=False,
+            evidence="模型输出短值补全用户输入中的受限事实槽位",
+            source="output",
+            match_type="semantic",
+            confidence=0.85,
+            accepted_values=[v for v in output_values if v],
+        )
+
+    def _slot_safe_user_context(self, user_input: str) -> str:
+        text = str(user_input or "").strip()
+        text = re.sub(r"[？?。！!，,；;：:\s]+$", "", text)
+        text = re.sub(r"^(请问|请告知|请查询|查询|请|问)", "", text)
+        for term in sorted(_SLOT_QUERY_TERMS, key=len, reverse=True):
+            text = text.replace(term, "")
+        text = text.rstrip("为是的")
+        return text[:80]
+
+    @staticmethod
+    def _normalize_slot_text(text: str) -> str:
+        normalized = unicodedata.normalize("NFKC", str(text or "")).lower()
+        normalized = normalized.replace("％", "%")
+        normalized = re.sub(r"[\s\W_]+", "", normalized, flags=re.UNICODE)
+        return normalized
+
+    def _output_refuses_or_deflects(self, model_output: str) -> bool:
+        output_norm = self._normalize_confirmation_text(model_output)
+        if not output_norm:
+            return True
+        return any(
+            self._normalize_confirmation_text(term) in output_norm
+            for term in _REFUSAL_TERMS
+        )
+
+    @staticmethod
+    def _normalize_confirmation_text(text: str) -> str:
+        normalized = unicodedata.normalize("NFKC", str(text or "")).lower()
+        normalized = re.sub(r"[\s\W_]+", "", normalized, flags=re.UNICODE)
+        return normalized
+
+    @staticmethod
+    def _append_unique(items: List[str], value: str) -> None:
+        value = str(value or "").strip()
+        if value and value not in items:
+            items.append(value)
+
+    def _merge_dedup_findings(
+        self,
+        findings: List[RiskFinding],
+        additions: List[RiskFinding],
+    ) -> List[RiskFinding]:
+        merged = list(findings)
+        for addition in additions:
+            add_fields = set(addition.restored_fields or [])
+            duplicate = False
+            for existing in merged:
+                if existing.target_asset_id != addition.target_asset_id:
+                    continue
+                if existing.finding_type == addition.finding_type:
+                    duplicate = True
+                    break
+                if existing.finding_type == "direct_protected_disclosure":
+                    existing_fields = set(existing.restored_fields or [])
+                    if add_fields and existing_fields and add_fields & existing_fields:
+                        duplicate = True
+                        break
+            if not duplicate:
+                merged.append(addition)
+
+        merged.sort(
+            key=lambda f: (f.score, len(f.key_anchor_ids), len(f.anchors)),
+            reverse=True,
+        )
+        return merged
+
     def _filter_candidates_by_context_anchors(
         self,
         context_anchors: list[Anchor],
@@ -1697,6 +2333,19 @@ class CFAScoreEngine:
             )
         else:
             findings = self._build_findings(all_anchors)
+
+        confirmation_findings = self._build_input_hypothesis_confirmation_findings(
+            all_anchors,
+            model_output=model_output,
+        )
+        findings = self._merge_dedup_findings(findings, confirmation_findings)
+
+        slot_findings = self._build_input_output_slot_restoration_findings(
+            all_anchors,
+            user_input=user_input,
+            model_output=model_output,
+        )
+        findings = self._merge_dedup_findings(findings, slot_findings)
 
         # Step 5: Sanitize
         x_replaced = self.sanitizer.make_x_replaced(model_output, findings)

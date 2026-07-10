@@ -140,6 +140,27 @@ class CandidateDocument:
 # Field hint boost table
 # ============================================================================
 
+CONFIDENTIAL_TEXT_FIELDS = {
+    "secret_content",
+    "secret_summary",
+    "secret_keywords",
+    "confidential_level",
+    "attack_paraphrases",
+}
+
+
+def is_weak_confidential_value(field_name: str, value: str) -> bool:
+    if field_name not in CONFIDENTIAL_TEXT_FIELDS:
+        return False
+    compact = normalize_text(str(value or ""))
+    compact = re.sub(r"[\s\W_]+", "", compact, flags=re.UNICODE)
+    if not compact:
+        return True
+    if len(compact) < 4:
+        return True
+    return False
+
+
 FIELD_HINTS: Dict[str, List[str]] = {
     "medication":       ["用药", "治疗", "处方", "药物", "双抗", "抗血小板",
                          "beta受体阻滞剂", "替格瑞洛", "阿司匹林", "华法林"],
@@ -267,6 +288,8 @@ class HybridSparseRetriever:
             for asset in self._assets:
                 value = asset.get(field_name)
                 if not value:
+                    continue
+                if is_weak_confidential_value(field_name, value):
                     continue
                 key = (field_name, value)
                 if key in seen:
@@ -398,12 +421,16 @@ class HybridSparseRetriever:
 
         # canonical_value match
         for cv in source.get("canonical_value", []):
+            if is_weak_confidential_value(doc.field_name, cv):
+                continue
             if cv and cv in text_norm:
                 raw_score += 3.5
                 matched.append(f"cv:{cv}")
 
         # alias match
         for alias in source.get("aliases", []):
+            if is_weak_confidential_value(doc.field_name, alias):
+                continue
             if alias and alias in text_norm:
                 raw_score += 3.0
                 matched.append(f"alias:{alias}")

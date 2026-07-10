@@ -8,7 +8,12 @@ import { computeDiff } from './diffUtils';
  *   - Red background (strikethrough) for text removed from raw_answer
  *   - Blue background (underline) for text added in safe_answer
  */
-export default function DiffView({ rawAnswer, safeAnswer }) {
+export default function DiffView({
+  rawAnswer,
+  safeAnswer,
+  rawLabel = '📝 LLM 原始输出（不一致部分标红）',
+  safeLabel = '🔒 CFA 安全回答（不一致部分标蓝）',
+}) {
   const diffSegments = useMemo(() => {
     if (!rawAnswer || !safeAnswer) return [];
     return computeDiff(rawAnswer, safeAnswer);
@@ -58,10 +63,10 @@ export default function DiffView({ rawAnswer, safeAnswer }) {
     <div className="diff-container">
       <div className="diff-header">
         <span className="diff-label" style={{ color: 'var(--red)' }}>
-          📝 LLM 原始输出（不一致部分标红）
+          {rawLabel}
         </span>
         <span className="diff-label" style={{ color: 'var(--accent)' }}>
-          🔒 CFA 安全回答（不一致部分标蓝）
+          {safeLabel}
         </span>
       </div>
       <div className="diff-panels">

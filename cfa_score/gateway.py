@@ -7,7 +7,7 @@ Orchestrates the full pipeline:
     → LLM generation (DeepSeek) → raw_answer
     → CFA-Score analysis (engine.analyze)
     → safe_answer / secondary_safe_answer selection
-    → return CFA-processed answer only (raw_answer is never exposed)
+    → return CFA-processed answer plus raw-answer transparency for non-sensitive demos
 
 Two operation modes:
   - ``handle_chat()``    — Full pipeline: LLM generate + CFA analyze + safe answer
@@ -17,7 +17,7 @@ Design principles:
   - Zero external dependencies (Python stdlib only)
   - Scenario assets/policy are loaded once and cached
   - CFAScoreEngine is created per request (thread-safe, lightweight)
-  - raw_answer, anchors, reduction_chain are NEVER returned to callers
+  - confidential raw_answer, anchors, reduction_chain are NEVER returned to callers
 """
 
 from __future__ import annotations
@@ -76,13 +76,18 @@ class GatewayResponse:
     answer_strategy: str = ""   # "cfa_gated" | "general_answer" | "weather_answer" | "need_city_prompt"
     llm_debug_refs: List[Dict[str, Any]] = field(default_factory=list)
     sensitive_response: bool = False
+    confidential_context_summary: Optional[Dict[str, Any]] = None
+    confidential_cfa_evidence: Optional[List[Dict[str, Any]]] = None
+    demo_raw_answer: str = ""
+    demo_raw_answer_redacted: str = ""
+    demo_raw_answer_mode: str = ""
 
     def to_dict(self, debug: bool = False) -> Dict[str, Any]:
         """Serialize to dict.
 
-        ``debug=True`` may include raw/finding details for ordinary scenarios.
-        Confidential responses ignore debug details so restored fact IDs and
-        reduction evidence never leave the backend.
+        Ordinary scenarios expose raw/safe answer pairs for the demo UI.
+        Confidential responses ignore debug details so raw model output,
+        restored fact IDs and reduction evidence never leave the backend.
         """
         data: Dict[str, Any] = {
             "request_id": self.request_id,
@@ -97,9 +102,19 @@ class GatewayResponse:
             "answer_strategy": self.answer_strategy,
             "llm_debug_refs": self.llm_debug_refs,
         }
-        if debug and not self.sensitive_response:
+        if not self.sensitive_response:
             data["raw_answer"] = self.raw_answer
             data["findings_summary"] = self.findings_summary
+        if self.confidential_context_summary:
+            data["confidential_context_summary"] = self.confidential_context_summary
+        if self.confidential_cfa_evidence is not None:
+            data["confidential_cfa_evidence"] = self.confidential_cfa_evidence
+        if self.demo_raw_answer:
+            data["demo_raw_answer"] = self.demo_raw_answer
+            data["demo_raw_answer_mode"] = self.demo_raw_answer_mode or "raw"
+        elif self.demo_raw_answer_redacted:
+            data["demo_raw_answer_redacted"] = self.demo_raw_answer_redacted
+            data["demo_raw_answer_mode"] = self.demo_raw_answer_mode or "redacted"
         return data
 
 
@@ -183,6 +198,7 @@ class CFAGateway:
 
         # Cached per scenario: (assets, policy, deepseek_client)
         self._scenario_cache: Dict[str, dict] = {}
+        self._confidential_distributed_kb_cache: Optional[List[Dict[str, Any]]] = None
 
         # Default system prompts per scenario
         self._system_prompts: Dict[str, str] = {
@@ -243,6 +259,9 @@ class CFAGateway:
         scenario: str = "healthcare",
         mode: str = "rule_only",
         secondary_check: bool = False,
+        include_confidential_raw_demo: bool = False,
+        confidential_raw_demo_mode: str = "raw",
+        include_confidential_cfa_evidence: bool = False,
     ) -> GatewayResponse:
         """Full pipeline: LLM generation → CFA analysis → safe answer.
 
@@ -262,6 +281,7 @@ class CFAGateway:
         # ---- Step 0: Intent classification (when scenario is "auto" or "general") ----
         intent_info = classify_intent(user_input)
         effective_scenario = scenario
+        preloaded_resources = None
 
         if scenario in ("auto", "general"):
             if is_domain_intent(intent_info):
@@ -271,16 +291,31 @@ class CFAGateway:
                 # Non-domain intent → handle as general chat (no CFA pipeline)
                 return self._handle_general_chat(request_id, user_input, intent_info, mode)
 
+        if scenario == "confidential":
+            confidential_assets, confidential_policy = self._load_scenario("confidential")
+            confidential_decision = ConfidentialLocalService(
+                assets=confidential_assets,
+                policy=confidential_policy,
+            ).classify_and_match(user_input)
+            if self._should_route_confidential_to_general(user_input, intent_info, confidential_decision):
+                return self._handle_general_chat(request_id, user_input, intent_info, mode)
+            preloaded_resources = (confidential_assets, confidential_policy)
+            effective_scenario = "confidential"
+
         # ---- Step 1: Load scenario resources ----
-        assets, policy = self._load_scenario(effective_scenario)
+        if preloaded_resources is not None:
+            assets, policy = preloaded_resources
+        else:
+            assets, policy = self._load_scenario(effective_scenario)
 
         # ---- Step 2: Call LLM to generate raw_answer with domain boundary ----
         system_prompt = self._build_system_prompt(effective_scenario)
 
         llm_debug_refs: List[Dict[str, Any]] = []
+        confidential_context_summary: Optional[Dict[str, Any]] = None
         if effective_scenario == "confidential":
             # 保密场景只把脱敏聚合知识库发给外部 LLM；原始 assets/fact_pool 不外发。
-            raw_answer, llm_debug_refs = self._build_confidential_llm_answer(
+            raw_answer, llm_debug_refs, confidential_context_summary = self._build_confidential_llm_answer(
                 user_input=user_input,
                 assets=assets,
                 policy=policy,
@@ -336,6 +371,22 @@ class CFAGateway:
             )
 
         # ---- Step 5: Build public response ----
+        demo_raw_answer = ""
+        demo_raw_answer_redacted = ""
+        demo_raw_answer_mode = ""
+        confidential_cfa_evidence = None
+        if effective_scenario == "confidential" and include_confidential_raw_demo:
+            if confidential_raw_demo_mode in ("", "raw"):
+                demo_raw_answer = raw_answer
+                demo_raw_answer_mode = "raw"
+            elif confidential_raw_demo_mode == "redacted":
+                demo_raw_answer_redacted = self._redact_confidential_text_for_demo(raw_answer, assets, policy)
+                demo_raw_answer_mode = "redacted"
+            else:
+                raise ValueError("confidential_raw_demo_mode only supports 'raw' or 'redacted' in public API")
+        if effective_scenario == "confidential" and include_confidential_cfa_evidence:
+            confidential_cfa_evidence = self._build_confidential_cfa_evidence(result, assets, policy)
+
         return _build_response(
             request_id, result, final_answer, safe_used,
             intent=intent_info.domain,
@@ -343,6 +394,11 @@ class CFAGateway:
             answer_strategy="cfa_gated",
             llm_debug_refs=llm_debug_refs,
             sensitive_response=(effective_scenario == "confidential"),
+            confidential_context_summary=confidential_context_summary,
+            confidential_cfa_evidence=confidential_cfa_evidence,
+            demo_raw_answer=demo_raw_answer,
+            demo_raw_answer_redacted=demo_raw_answer_redacted,
+            demo_raw_answer_mode=demo_raw_answer_mode,
         )
 
     def handle_analyze(
@@ -352,6 +408,7 @@ class CFAGateway:
         scenario: str = "healthcare",
         mode: str = "rule_only",
         secondary_check: bool = False,
+        include_confidential_cfa_evidence: bool = False,
     ) -> GatewayResponse:
         """CFA-only pipeline: analyze an existing model_output (no LLM call).
 
@@ -396,6 +453,10 @@ class CFAGateway:
             )
 
         # 4. Build public response
+        confidential_cfa_evidence = None
+        if scenario == "confidential" and include_confidential_cfa_evidence:
+            confidential_cfa_evidence = self._build_confidential_cfa_evidence(result, assets, policy)
+
         return _build_response(
             request_id,
             result,
@@ -404,6 +465,7 @@ class CFAGateway:
             routed_scenario=scenario,
             answer_strategy="cfa_gated",
             sensitive_response=(scenario == "confidential"),
+            confidential_cfa_evidence=confidential_cfa_evidence,
         )
 
     # ------------------------------------------------------------------
@@ -600,6 +662,47 @@ class CFAGateway:
         }
         return adapter.generate(user_input, context=context)
 
+    def _call_llm_user_message_only(
+        self,
+        user_content: str,
+        debug_metadata: Mapping[str, Any] | None = None,
+    ) -> str:
+        """Call the LLM with a single user message and no system prompt."""
+        client = DeepSeekClient(config_from_env(self._env_path))
+        messages = [{"role": "user", "content": user_content}]
+        if debug_metadata is not None:
+            try:
+                return client.chat(messages, debug_metadata=debug_metadata)
+            except TypeError as exc:
+                if "debug_metadata" not in str(exc):
+                    raise
+        return client.chat(messages)
+
+    def _should_route_confidential_to_general(
+        self,
+        user_input: str,
+        intent_info,
+        confidential_decision: Mapping[str, Any],
+    ) -> bool:
+        """Return True when confidential mode received a clearly non-confidential query."""
+        if confidential_decision.get("matched"):
+            return False
+        if self._looks_like_confidential_request(user_input):
+            return False
+        return intent_info.domain in {GENERAL_WEATHER, GENERAL_CHAT, AMBIGUOUS}
+
+    @staticmethod
+    def _looks_like_confidential_request(user_input: str) -> bool:
+        text = str(user_input or "")
+        if not text.strip():
+            return False
+        return bool(re.search(
+            r"内部|涉密|保密|密级|授权|权限|项目代号|经费|预算|采购|合同|脱密|离职|任免|"
+            r"涉密人员|部署|服务器|终端|漏洞|整改|安全评估|审计|台账|涉密系统|内部系统|"
+            r"保密库|文件依据|审批结论|责任主体|承研单位|中期评估|加固方案|数据迁移|金额",
+            text,
+        ))
+
     def _build_confidential_safe_answer(self, user_input: str) -> str:
         """
         本地保密库安全模板 fallback。
@@ -621,8 +724,160 @@ class CFAGateway:
         scenario: str,
         mode: str,
         secondary_check: bool,
-    ) -> tuple[str, List[Dict[str, Any]]]:
-        """Use a sanitized confidential KB summary for primary LLM generation."""
+    ) -> tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+        """Progressively load simulated internal KB content for confidential answers."""
+        rows = self._load_confidential_distributed_kb()
+        if not rows:
+            return self._build_legacy_confidential_llm_answer(
+                user_input=user_input,
+                assets=assets,
+                policy=policy,
+                request_id=request_id,
+                scenario=scenario,
+                mode=mode,
+                secondary_check=secondary_check,
+            )
+
+        service = ConfidentialLocalService(assets=assets, policy=policy)
+        decision = service.classify_and_match(user_input)
+        sub_scene = str(decision.get("sub_scene") or "confidential_general") if decision.get("matched") else "confidential_general"
+        fallback = ConfidentialLocalService.get_safe_template(sub_scene)
+
+        catalog = self._build_confidential_kb_catalog(user_input, rows)
+        self._assert_progressive_confidential_kb_payload_allowed(catalog, stage="catalog")
+        selection_ref = {
+            "request_id": request_id,
+            "purpose": "confidential_kb_selection",
+            "stage": 1,
+            "stage_name": "kb_selection",
+            "scenario": scenario,
+            "effective_scenario": "confidential",
+            "mode": mode,
+            "secondary_check": secondary_check,
+            "inject_fact_pool": False,
+            "safe_knowledge_type": catalog.get("kb_type", "confidential_distributed_kb_catalog"),
+        }
+
+        stage1_status = "ok"
+        selection_source = "llm_selection"
+        try:
+            selection_text = self._call_llm_with_prompt(
+                self._build_confidential_kb_selection_query(user_input),
+                self._build_confidential_kb_selection_system_prompt(),
+                [],
+                policy,
+                inject_fact_pool=False,
+                safe_knowledge=catalog,
+                debug_metadata=selection_ref,
+            )
+            selection = self._parse_confidential_kb_selection(selection_text, catalog)
+        except Exception:
+            summary = self._build_progressive_confidential_context_summary(
+                rows=rows,
+                catalog=catalog,
+                selected_payload=None,
+                selection_source="selection_failed",
+                stage1_status="failed",
+                stage2_status="not_attempted",
+            )
+            return fallback, [selection_ref], summary
+
+        if selection.get("_no_internal_kb"):
+            if decision.get("matched"):
+                fallback_selection = self._select_confidential_units_deterministically(user_input, rows, catalog)
+            else:
+                fallback_selection = {}
+            if fallback_selection:
+                selection = fallback_selection
+                selection_source = "deterministic_fallback_no_internal_kb"
+            else:
+                selection = {}
+                selection_source = "no_internal_kb"
+        elif not selection:
+            if decision.get("matched"):
+                fallback_selection = self._select_confidential_units_deterministically(user_input, rows, catalog)
+            else:
+                fallback_selection = {}
+            if fallback_selection:
+                selection = fallback_selection
+                selection_source = "deterministic_fallback_empty_selection"
+            else:
+                selection_source = "empty_selection"
+        elif selection.get("_parse_fallback"):
+            fallback_selection = self._select_confidential_units_deterministically(user_input, rows, catalog)
+            if fallback_selection:
+                selection = fallback_selection
+                selection_source = "deterministic_fallback"
+            else:
+                selection = {}
+                selection_source = "parse_failed_empty_selection"
+                stage1_status = "parse_failed"
+
+        if not selection:
+            summary = self._build_progressive_confidential_context_summary(
+                rows=rows,
+                catalog=catalog,
+                selected_payload=None,
+                selection_source=selection_source,
+                stage1_status=stage1_status,
+                stage2_status="not_attempted",
+            )
+            return fallback, [selection_ref], summary
+
+        selected_payload = self._build_selected_confidential_content_units(rows, selection, selection_source)
+        self._assert_progressive_confidential_kb_payload_allowed(selected_payload, stage="selected_units")
+
+        answer_ref = {
+            "request_id": request_id,
+            "purpose": "confidential_answer_generation",
+            "stage": 2,
+            "stage_name": "answer_generation",
+            "scenario": scenario,
+            "effective_scenario": "confidential",
+            "mode": mode,
+            "secondary_check": secondary_check,
+            "inject_fact_pool": False,
+            "safe_knowledge_type": selected_payload.get("kb_type", "selected_confidential_content_units"),
+            "selection_source": selection_source,
+            "selected_kb_count": len(selected_payload.get("selected_records", [])),
+            "selected_content_unit_count": sum(
+                len(record.get("content_units", [])) for record in selected_payload.get("selected_records", [])
+            ),
+        }
+        summary = self._build_progressive_confidential_context_summary(
+            rows=rows,
+            catalog=catalog,
+            selected_payload=selected_payload,
+            selection_source=selection_source,
+            stage1_status=stage1_status,
+            stage2_status="ok",
+        )
+
+        try:
+            answer = self._call_llm_user_message_only(
+                self._build_confidential_selected_units_answer_query(user_input, selected_payload),
+                debug_metadata=answer_ref,
+            )
+        except Exception:
+            summary["stage2_status"] = "failed"
+            return fallback, [selection_ref, answer_ref], summary
+
+        if not self._is_confidential_text_safe(answer, assets, policy):
+            return answer, [selection_ref, answer_ref], summary
+        return answer, [selection_ref, answer_ref], summary
+
+    def _build_legacy_confidential_llm_answer(
+        self,
+        *,
+        user_input: str,
+        assets: List[AssetFact],
+        policy: FieldPolicy,
+        request_id: str,
+        scenario: str,
+        mode: str,
+        secondary_check: bool,
+    ) -> tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+        """Use the old sanitized summary path when no distributed KB is available."""
         safe_knowledge = self._build_sanitized_confidential_llm_kb(user_input, assets, policy)
         self._assert_sanitized_confidential_kb_safe(safe_knowledge, assets, policy)
 
@@ -640,34 +895,452 @@ class CFAGateway:
         }
 
         try:
-            answer = self._call_llm_with_prompt(
-                self._build_confidential_llm_query(safe_knowledge),
-                self._build_system_prompt("confidential"),
-                [],
-                policy,
-                inject_fact_pool=False,
-                safe_knowledge=safe_knowledge,
+            answer = self._call_llm_user_message_only(
+                self._build_confidential_llm_query(safe_knowledge, user_input),
                 debug_metadata=debug_ref,
             )
         except Exception:
-            return fallback, []
+            return fallback, [], safe_knowledge
 
         if not self._is_confidential_text_safe(answer, assets, policy):
-            # Keep the raw LLM output internal so the post-CFA local gate can
-            # record the direct-leak trigger in backend audit.  The confidential
-            # response serializer never exposes it to callers.
-            return answer, [debug_ref]
-        return answer, [debug_ref]
+            return answer, [debug_ref], safe_knowledge
+        return answer, [debug_ref], safe_knowledge
 
-    def _build_confidential_llm_query(self, safe_knowledge: Mapping[str, Any]) -> str:
-        current_query = safe_knowledge.get("current_query", {}) if isinstance(safe_knowledge, Mapping) else {}
-        related = bool(current_query.get("related"))
-        safe_topic = str(current_query.get("safe_topic") or "confidential_general")
+    def _build_confidential_llm_query(self, safe_knowledge: Mapping[str, Any], user_input: str) -> str:
         return (
-            "用户正在询问内部敏感信息。"
-            f"本地安全检索结果：related={related}，safe_topic={safe_topic}。"
-            "请只根据安全知识库摘要和回答策略生成概括性答复，不要猜测或补充任何具体内部事实。"
+            f"用户问题：{user_input}\n\n"
+            "已加载知识库内容：\n"
+            f"{json.dumps(safe_knowledge, ensure_ascii=False, indent=2)}"
         )
+
+    def _load_confidential_distributed_kb(self) -> List[Dict[str, Any]]:
+        """Load the simulated distributed internal KB used for progressive loading."""
+        if self._confidential_distributed_kb_cache is not None:
+            return self._confidential_distributed_kb_cache
+
+        path = self._base_dir / "config" / "simulated_internal_kb_distributed.jsonl"
+        rows: List[Dict[str, Any]] = []
+        if not path.exists():
+            self._confidential_distributed_kb_cache = rows
+            return rows
+
+        for line in path.read_text(encoding="utf-8-sig").splitlines():
+            if not line.strip():
+                continue
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            row = self._coerce_confidential_distributed_kb_row(raw)
+            if row:
+                rows.append(row)
+        self._confidential_distributed_kb_cache = rows
+        return rows
+
+    @staticmethod
+    def _coerce_confidential_distributed_kb_row(raw: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        kb_id = str(raw.get("kb_id") or "").strip()
+        if not kb_id:
+            return None
+        units: List[Dict[str, str]] = []
+        for item in raw.get("content_units") or []:
+            if not isinstance(item, Mapping):
+                continue
+            unit_id = str(item.get("unit_id") or "").strip()
+            text = str(item.get("text") or "").strip()
+            if not unit_id or not text:
+                continue
+            units.append({
+                "unit_id": unit_id,
+                "role": str(item.get("role") or "").strip() or "content",
+                "text": text,
+            })
+        if not units:
+            return None
+        return {
+            "kb_id": kb_id,
+            "topic": str(raw.get("topic") or "内部资料").strip() or "内部资料",
+            "retrieval_terms": [str(term) for term in (raw.get("retrieval_terms") or []) if str(term).strip()],
+            "content_units": units,
+        }
+
+    def _build_confidential_kb_catalog(
+        self,
+        user_input: str,
+        rows: List[Dict[str, Any]],
+        *,
+        limit: int = 30,
+    ) -> Dict[str, Any]:
+        ranked_rows = self._rank_confidential_distributed_rows(user_input, rows)
+        sent_rows = ranked_rows[:limit] if ranked_rows else rows[:limit]
+        entries: List[Dict[str, Any]] = []
+        for row in sent_rows:
+            roles = [unit.get("role", "content") for unit in row.get("content_units", [])]
+            unique_roles = list(dict.fromkeys(roles))
+            entries.append({
+                "kb_id": row["kb_id"],
+                "topic": row.get("topic", "内部资料"),
+                "description": self._build_confidential_catalog_description(row, unique_roles),
+                "available_content_units": [
+                    {"unit_id": unit["unit_id"], "role": unit.get("role", "content")}
+                    for unit in row.get("content_units", [])
+                ],
+            })
+        return {
+            "kb_type": "confidential_distributed_kb_catalog",
+            "version": 1,
+            "catalog_scope": {
+                "total_records": len(rows),
+                "sent_records": len(entries),
+            },
+            "selection_policy": {
+                "max_kb_records": 3,
+                "max_content_units_total": 12,
+            },
+            "entries": entries,
+        }
+
+    @staticmethod
+    def _build_confidential_catalog_description(row: Mapping[str, Any], roles: List[str]) -> str:
+        topic = str(row.get("topic") or "内部资料")
+        role_text = "、".join(roles[:6]) if roles else "content"
+        return f"主题为{topic}的内部资料条目，可按需加载的单元角色包括：{role_text}。"
+
+    @staticmethod
+    def _build_confidential_kb_selection_system_prompt() -> str:
+        return (
+            "你是内部知识库分步加载路由器。你只能根据给出的条目目录和可加载单元 ID "
+            "判断需要加载哪些 content_units。不要回答用户问题，不要复述目录内容。"
+            "只返回严格 JSON，不要 Markdown，不要解释。"
+        )
+
+    @staticmethod
+    def _build_confidential_kb_selection_query(user_input: str) -> str:
+        return (
+            "请根据用户问题，从目录中选择后续回答需要加载的 content_units。\n"
+            f"用户问题：{user_input}\n"
+            "输出严格 JSON，格式为："
+            "{\"needs_internal_kb\": true, "
+            "\"content_units_to_load\": [{\"kb_id\": \"...\", \"unit_ids\": [\"...\"]}], "
+            "\"confidence\": 0.0}。"
+            "最多选择 3 条 KB 记录、总计最多 12 个 unit_id；如果没有相关内容，返回空数组。"
+        )
+
+    def _parse_confidential_kb_selection(
+        self,
+        text: str,
+        catalog: Mapping[str, Any],
+    ) -> Dict[str, List[str]]:
+        try:
+            parsed = self._extract_json_object(text)
+        except ValueError:
+            return {"_parse_fallback": ["true"]}
+
+        if parsed.get("needs_internal_kb") is False:
+            return {"_no_internal_kb": ["true"]}
+
+        available = self._catalog_available_units(catalog)
+        selected: Dict[str, List[str]] = {}
+        total_units = 0
+        for item in parsed.get("content_units_to_load") or []:
+            if not isinstance(item, Mapping):
+                continue
+            kb_id = str(item.get("kb_id") or "").strip()
+            if kb_id not in available or len(selected) >= 3:
+                continue
+            for unit_id in item.get("unit_ids") or []:
+                unit_id = str(unit_id or "").strip()
+                if unit_id not in available[kb_id]:
+                    continue
+                bucket = selected.setdefault(kb_id, [])
+                if unit_id in bucket:
+                    continue
+                bucket.append(unit_id)
+                total_units += 1
+                if total_units >= 12:
+                    return selected
+        return selected
+
+    @staticmethod
+    def _extract_json_object(text: str) -> Dict[str, Any]:
+        raw = str(text or "").strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+            raw = re.sub(r"\s*```$", "", raw)
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start < 0 or end < start:
+            raise ValueError("No JSON object found")
+        data = json.loads(raw[start:end + 1])
+        if not isinstance(data, dict):
+            raise ValueError("Selection JSON must be an object")
+        return data
+
+    @staticmethod
+    def _catalog_available_units(catalog: Mapping[str, Any]) -> Dict[str, set[str]]:
+        available: Dict[str, set[str]] = {}
+        for entry in catalog.get("entries") or []:
+            if not isinstance(entry, Mapping):
+                continue
+            kb_id = str(entry.get("kb_id") or "")
+            units = {
+                str(unit.get("unit_id") or "")
+                for unit in entry.get("available_content_units") or []
+                if isinstance(unit, Mapping) and unit.get("unit_id")
+            }
+            if kb_id and units:
+                available[kb_id] = units
+        return available
+
+    def _select_confidential_units_deterministically(
+        self,
+        user_input: str,
+        rows: List[Dict[str, Any]],
+        catalog: Mapping[str, Any],
+    ) -> Dict[str, List[str]]:
+        available = self._catalog_available_units(catalog)
+        ranked_rows = [row for row in self._rank_confidential_distributed_rows(user_input, rows) if row.get("kb_id") in available]
+        if not ranked_rows:
+            return {}
+        preferred_roles = {
+            "background_context": 0,
+            "semantic_anchor_background": 1,
+            "semantic_anchor_object": 2,
+            "semantic_anchor_action_or_result": 3,
+            "response_boundary": 4,
+            "restoration_risk_note": 5,
+            "soft_anchor_terms": 6,
+        }
+        selected: Dict[str, List[str]] = {}
+        total = 0
+        for row in ranked_rows[:3]:
+            kb_id = row["kb_id"]
+            units = sorted(
+                row.get("content_units", []),
+                key=lambda unit: preferred_roles.get(unit.get("role", ""), 99),
+            )
+            for unit in units:
+                unit_id = unit["unit_id"]
+                if unit_id not in available.get(kb_id, set()):
+                    continue
+                selected.setdefault(kb_id, []).append(unit_id)
+                total += 1
+                if total >= 12 or len(selected[kb_id]) >= 5:
+                    break
+            if total >= 12:
+                break
+        return selected
+
+    def _rank_confidential_distributed_rows(
+        self,
+        user_input: str,
+        rows: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        query = _normalize_confidential_match_text(user_input)
+        scored: List[tuple[int, int, Dict[str, Any]]] = []
+        for idx, row in enumerate(rows):
+            score = 0
+            topic = _normalize_confidential_match_text(str(row.get("topic") or ""))
+            if topic and topic in query:
+                score += 6
+            for term in row.get("retrieval_terms") or []:
+                term_norm = _normalize_confidential_match_text(str(term))
+                if term_norm and term_norm in query:
+                    score += 12
+            for unit in row.get("content_units") or []:
+                text_norm = _normalize_confidential_match_text(unit.get("text", ""))
+                if not text_norm:
+                    continue
+                for part in self._query_signal_terms(query):
+                    if part and part in text_norm:
+                        score += 2
+            service_score = self._confidential_local_row_score(query, row)
+            if service_score > 0:
+                score += service_score
+            if score > 0:
+                scored.append((score, -idx, row))
+        scored.sort(reverse=True, key=lambda item: (item[0], item[1]))
+        return [row for _, _, row in scored]
+
+    @staticmethod
+    def _query_signal_terms(query: str) -> List[str]:
+        terms = re.findall(r"[\w一-鿿]{2,}", query)
+        signals: List[str] = []
+        for term in terms:
+            if len(term) <= 12:
+                signals.append(term)
+                continue
+            for size in (8, 6, 4):
+                for start in range(0, max(len(term) - size + 1, 0), size):
+                    signals.append(term[start:start + size])
+        return signals[:40]
+
+    @staticmethod
+    def _confidential_local_row_score(query: str, row: Mapping[str, Any]) -> int:
+        """Score a distributed-KB row using character n-grams for short entity queries.
+
+        This is intentionally local/deterministic.  It catches questions like
+        "韩雪梅提出了什么内容？" where the first-stage LLM may return
+        needs_internal_kb=false even though a matching confidential row exists.
+        """
+        if not query:
+            return 0
+        haystacks = [
+            _normalize_confidential_match_text(str(row.get("topic") or "")),
+            _normalize_confidential_match_text(str(row.get("kb_summary") or "")),
+        ]
+        for unit in row.get("content_units") or []:
+            if isinstance(unit, Mapping):
+                haystacks.append(_normalize_confidential_match_text(str(unit.get("text") or "")))
+        full_text = "".join(haystacks)
+        if not full_text:
+            return 0
+        score = 0
+        for gram in CFAGateway._confidential_query_ngrams(query):
+            if gram in full_text:
+                score += len(gram)
+        return score
+
+    @staticmethod
+    def _confidential_query_ngrams(query: str) -> List[str]:
+        stop_terms = {
+            "什么", "内容", "情况", "具体", "请问", "请告知", "告知", "提出", "查询",
+            "一下", "相关", "多少", "多久", "是否", "怎么", "如何",
+        }
+        grams: List[str] = []
+        for run in re.findall(r"[一-鿿A-Za-z0-9]+", query):
+            if len(run) < 2:
+                continue
+            for stop in stop_terms:
+                run = run.replace(stop, "")
+            if len(run) >= 2:
+                grams.append(run)
+            for size in (4, 3, 2):
+                if len(run) < size:
+                    continue
+                for idx in range(0, len(run) - size + 1):
+                    gram = run[idx:idx + size]
+                    if gram not in stop_terms:
+                        grams.append(gram)
+        result: List[str] = []
+        seen = set()
+        for gram in sorted(grams, key=len, reverse=True):
+            if gram and gram not in seen:
+                seen.add(gram)
+                result.append(gram)
+        return result[:40]
+
+    def _build_selected_confidential_content_units(
+        self,
+        rows: List[Dict[str, Any]],
+        selection: Mapping[str, List[str]],
+        selection_source: str,
+    ) -> Dict[str, Any]:
+        row_by_id = {row["kb_id"]: row for row in rows}
+        selected_records: List[Dict[str, Any]] = []
+        total_units = 0
+        for kb_id, unit_ids in selection.items():
+            if kb_id.startswith("_") or kb_id not in row_by_id or len(selected_records) >= 3:
+                continue
+            row = row_by_id[kb_id]
+            unit_by_id = {unit["unit_id"]: unit for unit in row.get("content_units", [])}
+            content_units: List[Dict[str, str]] = []
+            for unit_id in unit_ids:
+                if unit_id not in unit_by_id:
+                    continue
+                unit = unit_by_id[unit_id]
+                content_units.append({
+                    "unit_id": unit["unit_id"],
+                    "role": unit.get("role", "content"),
+                    "text": unit.get("text", ""),
+                })
+                total_units += 1
+                if total_units >= 12:
+                    break
+            if content_units:
+                selected_records.append({
+                    "kb_id": kb_id,
+                    "topic": row.get("topic", "内部资料"),
+                    "content_units": content_units,
+                })
+            if total_units >= 12:
+                break
+        return {
+            "kb_type": "selected_confidential_content_units",
+            "version": 1,
+            "selection_source": selection_source,
+            "selected_records": selected_records,
+        }
+
+    @staticmethod
+    def _build_confidential_selected_units_answer_query(
+        user_input: str,
+        selected_payload: Mapping[str, Any],
+    ) -> str:
+        slot_schema = {
+            "Time": "时间",
+            "Subject": "主体 / 责任方 / 汇报人 / 机构",
+            "Object": "对象 / 项目 / 系统 / 文件 / 印章 / 数据",
+            "Action": "动作 / 行为 / 决策 / 处理方式",
+            "Location": "地点 / 部署位置 / 数据中心 / 区域",
+            "Condition": "条件 / 背景 / 触发原因",
+            "Result": "结果 / 结论 / 影响 / 暴露问题",
+            "Requirement": "要求 / 后续安排 / 审批 / 整改期限",
+            "Quantity": "数量 / 金额 / 比例 / 容量 / 期限",
+            "Sensitivity": "密级 / 涉密属性 / 保密类别",
+        }
+        return (
+            f"用户问题：{user_input}\n\n"
+            "已加载知识库内容：\n"
+            f"{json.dumps(selected_payload, ensure_ascii=False, indent=2)}\n\n"
+            "请先在内部按以下槽位理解用户问题与已加载内容，用于后续 CFA 组合事实风险检测：\n"
+            f"{json.dumps(slot_schema, ensure_ascii=False, indent=2)}\n"
+            "然后输出自然语言回答，不要输出 JSON 或槽位表。"
+        )
+
+    @staticmethod
+    def _build_progressive_confidential_context_summary(
+        *,
+        rows: List[Dict[str, Any]],
+        catalog: Mapping[str, Any],
+        selected_payload: Optional[Mapping[str, Any]],
+        selection_source: str,
+        stage1_status: str,
+        stage2_status: str,
+    ) -> Dict[str, Any]:
+        selected_records = selected_payload.get("selected_records", []) if isinstance(selected_payload, Mapping) else []
+        return {
+            "kb_type": "progressive_confidential_internal_kb",
+            "version": 1,
+            "total_records": len(rows),
+            "catalog_entries_sent": len(catalog.get("entries", [])),
+            "selection_source": selection_source,
+            "selected_kb_count": len(selected_records),
+            "selected_content_unit_count": sum(len(record.get("content_units", [])) for record in selected_records),
+            "stage1_purpose": "confidential_kb_selection",
+            "stage2_purpose": "confidential_answer_generation",
+            "stage1_status": stage1_status,
+            "stage2_status": stage2_status,
+        }
+
+    @staticmethod
+    def _assert_progressive_confidential_kb_payload_allowed(kb: Mapping[str, Any], *, stage: str) -> None:
+        raw = json.dumps(kb, ensure_ascii=False, sort_keys=True)
+        forbidden_fields = [
+            "source_secret_id",
+            "source_confidential_level",
+            "retrieval_terms",
+            "do_not_send_to_llm_fields",
+            "evaluation_note",
+            "risk_level",
+            "llm_visible_text",
+        ]
+        hits = [field for field in forbidden_fields if field in raw]
+        if stage == "catalog":
+            hits.extend(field for field in ["content_units", "text"] if f'"{field}"' in raw)
+        if hits:
+            raise RuntimeError(f"Progressive confidential KB payload contains forbidden fields: {sorted(set(hits))}")
+        _assert_no_confidential_prompt([{"role": "user", "content": raw}])
 
     def _build_sanitized_confidential_llm_kb(
         self,
@@ -732,6 +1405,29 @@ class CFAGateway:
         # Reuse the outbound-prompt marker guard with the serialized KB.
         _assert_no_confidential_prompt([{"role": "user", "content": raw}])
 
+    def _redact_confidential_text_for_demo(
+        self,
+        text: str,
+        assets: List[AssetFact],
+        policy: FieldPolicy,
+    ) -> str:
+        """Return a display-only raw answer with confidential values removed."""
+        redacted = str(text or "")
+        hits = self._detect_confidential_direct_leak(redacted, assets, policy)
+        for hit in sorted(hits, key=len, reverse=True):
+            if not hit:
+                continue
+            placeholder = "[已脱敏:受保护事实]"
+            sentence_pattern = rf"[^。！？!?；;\n]*{re.escape(hit)}[^。！？!?；;\n]*"
+            redacted = re.sub(sentence_pattern, placeholder, redacted)
+            compact_hit = re.sub(r"\s+", "", hit)
+            if compact_hit and compact_hit != hit:
+                compact_pattern = rf"[^。！？!?；;\n]*{re.escape(compact_hit)}[^。！？!?；;\n]*"
+                redacted = re.sub(compact_pattern, placeholder, redacted)
+        if not self._is_confidential_text_safe(redacted, assets, policy):
+            return "[LLM 原始回答命中保密事实，已由后端脱敏隐藏。]"
+        return redacted
+
     def _is_confidential_text_safe(
         self,
         text: str,
@@ -770,7 +1466,7 @@ class CFAGateway:
         raw_text = str(text or "")
         normalized_text = _normalize_confidential_match_text(raw_text)
         forbidden_markers = [
-            "SEC-", "保密内容=", "保密关键词=", "保密类别=", "保密摘要=",
+            "SEC-", "IKB-", "保密内容=", "保密关键词=", "保密类别=", "保密摘要=",
             "保密事实库", "密级=", "机密★", "绝密★", "秘密★",
             "【内部资产台账】",
         ]
@@ -835,6 +1531,19 @@ class CFAGateway:
             seen.add(value)
             deduped.append(value)
         return deduped
+
+    @staticmethod
+    def _is_weak_confidential_sensitive_value(field_name: str, value: str) -> bool:
+        if field_name not in {
+            "secret_content", "secret_summary", "secret_keywords", "confidential_level", "attack_paraphrases",
+        }:
+            return False
+        compact = _normalize_confidential_match_text(value)
+        if not compact:
+            return True
+        if len(compact) < 4:
+            return True
+        return False
 
     def _handle_general_chat(
         self,
@@ -963,6 +1672,8 @@ class CFAGateway:
                 "direct_protected_disclosure",
                 "indirect_asset_restoration",
                 "indirect_protected_value_restoration",
+                "input_hypothesis_confirmation",
+                "input_output_slot_restoration",
             }
             or (
                 finding.final_candidate_count == 1
@@ -974,7 +1685,7 @@ class CFAGateway:
         selected_answer = final_answer
         selected_safe_used = safe_used
         if risk_detected:
-            selected_answer = self._confidential_safe_template_for_input(user_input, assets, policy)
+            selected_answer = self._confidential_safe_template_for_input(user_input, assets, policy, result)
             selected_safe_used = "cfa_safe_answer"
 
         self._write_confidential_audit_event(
@@ -992,11 +1703,157 @@ class CFAGateway:
         user_input: str,
         assets: List[AssetFact],
         policy: FieldPolicy,
+        result: Optional[AnalysisResult] = None,
     ) -> str:
+        slot_answer = self._confidential_slot_safe_answer_for_input(user_input, result)
+        if slot_answer:
+            return slot_answer
         service = ConfidentialLocalService(assets=assets, policy=policy)
         decision = service.classify_and_match(user_input)
         sub_scene = decision.get("sub_scene", "confidential_general") if decision.get("matched") else "confidential_general"
         return ConfidentialLocalService.get_safe_template(str(sub_scene))
+
+    def _confidential_slot_safe_answer_for_input(
+        self,
+        user_input: str,
+        result: Optional[AnalysisResult],
+    ) -> str:
+        if result is None or not result.findings:
+            return ""
+        has_slot_restoration = any(
+            f.finding_type == "input_output_slot_restoration"
+            for f in result.findings
+        )
+        if not has_slot_restoration and not self._looks_like_confidential_slot_query(user_input):
+            return ""
+        subject = self._extract_confidential_slot_subject(user_input)
+        if not subject:
+            return ""
+        return f"根据查询到的信息，{subject}为受保护。"
+
+    @staticmethod
+    def _looks_like_confidential_slot_query(user_input: str) -> bool:
+        text = unicodedata.normalize("NFKC", str(user_input or "")).lower()
+        compact = re.sub(r"[\s\W_]+", "", text, flags=re.UNICODE)
+        query_terms = ("多少", "几分", "多少分", "是什么", "为多少", "是多少", "多久")
+        attribute_terms = (
+            "成绩", "考试", "分数", "结果", "结论", "期限", "金额", "预算", "经费", "比例",
+            "数量", "容量", "级别", "密级", "类别", "属性", "要求", "安排", "脱密期",
+        )
+        return any(term in compact for term in query_terms) and any(term in compact for term in attribute_terms)
+
+    @staticmethod
+    def _extract_confidential_slot_subject(user_input: str) -> str:
+        text = unicodedata.normalize("NFKC", str(user_input or "")).strip()
+        text = re.sub(r"[？?。！!，,；;：:\s]+$", "", text)
+        text = re.sub(r"^(请问|请告知|请查询|查询一下|查一下|查询|请|问)", "", text)
+        replacements = [
+            "为多少分", "是多少分", "多少分", "几分", "为多少", "是多少", "是什么", "多少", "吗", "呢",
+        ]
+        for item in sorted(replacements, key=len, reverse=True):
+            text = text.replace(item, "")
+        text = text.rstrip("为是的")
+        text = re.sub(r"\s+", "", text)
+        if len(text) < 4 or len(text) > 80:
+            return ""
+        return text
+
+    def _build_confidential_cfa_evidence(
+        self,
+        result: AnalysisResult,
+        assets: List[AssetFact],
+        policy: FieldPolicy,
+    ) -> List[Dict[str, Any]]:
+        """Build opt-in local-demo evidence for restored confidential facts."""
+        asset_by_id = {asset.id: asset for asset in assets}
+        evidence: List[Dict[str, Any]] = []
+        for finding in result.findings:
+            target_asset = asset_by_id.get(finding.target_asset_id)
+            restored_fact = finding.restored_fact or self._format_restored_fact_for_evidence(
+                finding,
+                target_asset,
+                policy,
+            )
+            restored_fields = []
+            for field_name in finding.restored_fields or []:
+                restored_fields.append({
+                    "name": field_name,
+                    "label": policy.label(field_name),
+                    "value": target_asset.get(field_name) if target_asset else "",
+                })
+            reasoning_process = self._build_confidential_reasoning_process(
+                finding,
+                restored_fact,
+            )
+            evidence.append({
+                "target_id": finding.target_asset_id,
+                "target_name": finding.target_asset_name or (target_asset.display_name(policy.display_field) if target_asset else ""),
+                "risk_level": finding.risk_level,
+                "score": finding.score,
+                "finding_type": finding.finding_type,
+                "restored_fact": restored_fact,
+                "restored_fields": restored_fields,
+                "reason": finding.reason,
+                "key_anchors": list(finding.key_anchor_summary or []),
+                "reduction_chain": [step.to_dict() for step in finding.reduction_chain],
+                "reasoning_process": reasoning_process,
+                "input_candidate_count": finding.input_candidate_count,
+                "final_candidate_count": finding.final_candidate_count,
+                "information_gain_bits": finding.information_gain_bits,
+            })
+        return evidence
+
+    @staticmethod
+    def _build_confidential_reasoning_process(
+        finding: RiskFinding,
+        restored_fact: str,
+    ) -> List[str]:
+        steps: List[str] = []
+        key_anchors = list(finding.key_anchor_summary or [])
+        input_anchors = [item for item in key_anchors if item.startswith("用户输入/")]
+        output_anchors = [item for item in key_anchors if item.startswith("模型输出/")]
+
+        if input_anchors:
+            steps.append("用户输入命中或假设了受限事实锚点：" + "；".join(input_anchors[:3]))
+        else:
+            steps.append("CFA 从用户输入中提取上下文锚点，用于限定候选事实集合。")
+
+        if output_anchors:
+            steps.append("LLM 原始输出新增确认/复述信号：" + "；".join(output_anchors[:4]))
+        else:
+            steps.append("LLM 原始输出提供了可参与组合还原的线索。")
+
+        if finding.input_candidate_count or finding.final_candidate_count:
+            steps.append(
+                f"CFA 候选收敛：{finding.input_candidate_count or 0} → "
+                f"{finding.final_candidate_count or 0}，信息增益 "
+                f"{finding.information_gain_bits:.2f} bit。"
+            )
+
+        if restored_fact:
+            steps.append("被还原的受限事实：" + restored_fact)
+        steps.append("最终答复由 CFA/本地保密闸门替换为安全授权查询提示。")
+        return steps
+
+    @staticmethod
+    def _format_restored_fact_for_evidence(
+        finding: RiskFinding,
+        asset: Optional[AssetFact],
+        policy: FieldPolicy,
+    ) -> str:
+        if asset is None:
+            return "受控字段状态被还原"
+        field_names = list(finding.restored_fields or [])
+        if not field_names:
+            field_names = [field for field in policy.protected_fields if asset.get(field)]
+        parts = [
+            f"{policy.label(field)}={asset.get(field)}"
+            for field in field_names
+            if asset.get(field)
+        ]
+        if not parts:
+            parts.append("受控字段状态被间接还原")
+        return f"{asset.display_name(policy.display_field)}：" + "，".join(parts)
 
     def _build_direct_leak_findings(
         self,
@@ -1043,6 +1900,7 @@ class CFAGateway:
             if field_name not in sensitive_fields:
                 sensitive_fields.append(field_name)
 
+        covered_by_existing_finding = False
         for asset in assets:
             matched_fields: List[str] = []
             asset_values: List[str] = [asset.id]
@@ -1051,7 +1909,7 @@ class CFAGateway:
                 values = raw_value if isinstance(raw_value, list) else [raw_value]
                 for value in values:
                     value_text = str(value or "").strip()
-                    if not value_text:
+                    if not value_text or self._is_weak_confidential_sensitive_value(field_name, value_text):
                         continue
                     asset_values.append(value_text)
                     value_norm = _normalize_confidential_match_text(value_text)
@@ -1063,7 +1921,10 @@ class CFAGateway:
             if not matched_fields and any(hit_norm and hit_norm in asset_blob_norm for hit_norm in hit_norms):
                 matched_fields = protected_fields or ["secret_content"]
 
-            if not matched_fields or asset.id in existing_ids:
+            if not matched_fields:
+                continue
+            if asset.id in existing_ids:
+                covered_by_existing_finding = True
                 continue
 
             findings.append(
@@ -1086,7 +1947,7 @@ class CFAGateway:
                 )
             )
 
-        if not findings:
+        if not findings and not covered_by_existing_finding:
             findings.append(
                 RiskFinding(
                     target_asset_id="",
@@ -1592,6 +2453,11 @@ def _build_response(
     answer_strategy: str = "",
     llm_debug_refs: Optional[List[Dict[str, Any]]] = None,
     sensitive_response: bool = False,
+    confidential_context_summary: Optional[Dict[str, Any]] = None,
+    confidential_cfa_evidence: Optional[List[Dict[str, Any]]] = None,
+    demo_raw_answer: str = "",
+    demo_raw_answer_redacted: str = "",
+    demo_raw_answer_mode: str = "",
 ) -> GatewayResponse:
     # Determine aggregate risk level and score
     if result.findings:
@@ -1638,6 +2504,11 @@ def _build_response(
         answer_strategy=answer_strategy,
         llm_debug_refs=list(llm_debug_refs or []),
         sensitive_response=sensitive_response,
+        confidential_context_summary=confidential_context_summary,
+        confidential_cfa_evidence=confidential_cfa_evidence,
+        demo_raw_answer=demo_raw_answer,
+        demo_raw_answer_redacted=demo_raw_answer_redacted,
+        demo_raw_answer_mode=demo_raw_answer_mode,
     )
 
 

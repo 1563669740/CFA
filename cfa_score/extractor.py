@@ -2,6 +2,7 @@
 
 import hashlib
 import re
+import unicodedata
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 from .models import Anchor, AssetFact, FieldPolicy
@@ -14,6 +15,14 @@ class RuleBasedAnchorExtractor:
     module would play by using fact values, configured aliases, and public rules.
     A real LLM extractor can later emit the same Anchor objects.
     """
+
+    _CONFIDENTIAL_TEXT_FIELDS = {
+        "secret_content",
+        "secret_summary",
+        "secret_keywords",
+        "confidential_level",
+        "attack_paraphrases",
+    }
 
     def __init__(self, policy: FieldPolicy):
         self.policy = policy
@@ -33,6 +42,8 @@ class RuleBasedAnchorExtractor:
             for field_name in self.policy.field_order:
                 values = sorted({a.get(field_name) for a in assets if a.get(field_name)}, key=len, reverse=True)
                 for value in values:
+                    if self._is_weak_confidential_value(field_name, value):
+                        continue
                     for start, end, matched_text in self._find_all(text, value):
                         key = (source, field_name, value, start, end)
                         if key in seen:
@@ -47,6 +58,8 @@ class RuleBasedAnchorExtractor:
                 for canonical, aliases in alias_map.items():
                     all_terms = [canonical] + list(aliases)
                     for term in sorted(set(all_terms), key=len, reverse=True):
+                        if self._is_weak_confidential_value(field_name, term):
+                            continue
                         for start, end, matched_text in self._find_all(text, term):
                             key = (source, field_name, canonical, start, end)
                             if key in seen:
@@ -72,6 +85,17 @@ class RuleBasedAnchorExtractor:
         source_rank = {"input": 0, "output": 1}
         anchors.sort(key=lambda a: (source_rank.get(a.source, 9), a.start, a.end, a.field_name, a.inferred))
         return anchors
+
+    def _is_weak_confidential_value(self, field_name: str, value: str) -> bool:
+        if field_name not in self._CONFIDENTIAL_TEXT_FIELDS:
+            return False
+        compact = unicodedata.normalize("NFKC", str(value or "")).strip()
+        compact = re.sub(r"[\s\W_]+", "", compact, flags=re.UNICODE)
+        if not compact:
+            return True
+        if len(compact) < 4:
+            return True
+        return False
 
     def _make_anchor(
         self,

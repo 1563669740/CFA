@@ -50,6 +50,9 @@ from .intent_router import (
     GENERAL_CHAT,
     AMBIGUOUS,
 )
+
+# Gateway-level domain constant (not an intent classifier output)
+DOMAIN_CONFIDENTIAL = "domain_confidential"
 from .knowledge import load_assets, load_policy, load_public_knowledge, load_semantic_aliases, merge_public_knowledge
 from .models import AnalysisResult, FieldPolicy, AssetFact, RiskFinding
 from .tracing import create_trace_recorder
@@ -309,6 +312,13 @@ class CFAGateway:
         effective_scenario = scenario
         preloaded_resources = None
 
+        # When scenario is explicitly specified, show the actual route rather than the generic intent classifier result.
+        # This prevents UI mismatches (e.g. showing "🏥 医疗健康" when the user explicitly selected "confidential").
+        if scenario not in ("auto", "general"):
+            displayed_intent = f"domain_{scenario}"
+        else:
+            displayed_intent = intent_info.domain
+
         if scenario in ("auto", "general"):
             if is_domain_intent(intent_info):
                 # Route to the matching domain scenario
@@ -461,7 +471,7 @@ class CFAGateway:
 
         return _build_response(
             request_id, result, final_answer, safe_used,
-            intent=intent_info.domain,
+            intent=displayed_intent,
             routed_scenario=effective_scenario,
             answer_strategy="cfa_gated",
             llm_debug_refs=llm_debug_refs,
@@ -1158,7 +1168,17 @@ class CFAGateway:
         *,
         limit: int = 30,
     ) -> Dict[str, Any]:
-        ranked_rows = self._rank_confidential_distributed_rows(user_input, rows)
+        # Build kb_id → negative_samples lookup from confidential assets
+        assets, _ = self._load_scenario("confidential")
+        kb_negative_map: Dict[str, List[str]] = {}
+        for asset in assets:
+            source_kb_id = asset.extra.get("source_kb_id", "")
+            if source_kb_id:
+                neg = asset.extra.get("negative_samples", [])
+                if isinstance(neg, list) and neg:
+                    kb_negative_map[str(source_kb_id)] = [str(s).strip() for s in neg if str(s).strip()]
+
+        ranked_rows = self._rank_confidential_distributed_rows(user_input, rows, kb_negative_map)
         sent_rows = ranked_rows[:limit] if ranked_rows else rows[:limit]
         entries: List[Dict[str, Any]] = []
         for row in sent_rows:
@@ -1321,11 +1341,27 @@ class CFAGateway:
         self,
         user_input: str,
         rows: List[Dict[str, Any]],
+        kb_negative_map: Optional[Dict[str, List[str]]] = None,
     ) -> List[Dict[str, Any]]:
         query = _normalize_confidential_match_text(user_input)
         scored: List[tuple[int, int, Dict[str, Any]]] = []
         for idx, row in enumerate(rows):
             score = 0
+
+            # -----------------------------------------------------------
+            # Negative-sample gate: if the query matches a negative_sample
+            # for this kb_id, the row should be strongly demoted.
+            # -----------------------------------------------------------
+            if kb_negative_map:
+                kb_id = str(row.get("kb_id") or "")
+                negative_samples = kb_negative_map.get(kb_id, [])
+                if negative_samples:
+                    for neg_text in negative_samples:
+                        neg_norm = _normalize_confidential_match_text(str(neg_text))
+                        if neg_norm and neg_norm in query:
+                            score -= 50  # large penalty to push it below positive matches
+                            break
+
             topic = _normalize_confidential_match_text(str(row.get("topic") or ""))
             if topic and topic in query:
                 score += 6
@@ -2005,6 +2041,7 @@ class CFAGateway:
                 "target_name": finding.target_asset_name or (target_asset.display_name(policy.display_field) if target_asset else ""),
                 "risk_level": finding.risk_level,
                 "score": finding.score,
+                "score_breakdown": finding.score_breakdown,
                 "finding_type": finding.finding_type,
                 "restored_fact": restored_fact,
                 "restored_fields": restored_fields,
@@ -2023,32 +2060,98 @@ class CFAGateway:
         finding: RiskFinding,
         restored_fact: str,
     ) -> List[str]:
-        steps: List[str] = []
+        """Build reasoning process text based on finding_type.
+
+        Each risk type gets its own template to avoid misrepresenting
+        direct disclosure as confirmation or candidate convergence.
+        """
+        finding_type = finding.finding_type
         key_anchors = list(finding.key_anchor_summary or [])
         input_anchors = [item for item in key_anchors if item.startswith("用户输入/")]
         output_anchors = [item for item in key_anchors if item.startswith("模型输出/")]
+        input_count = finding.input_candidate_count or 0
+        final_count = finding.final_candidate_count or 0
+        info_gain = finding.information_gain_bits
 
-        if input_anchors:
-            steps.append("用户输入命中或假设了受限事实锚点：" + "；".join(input_anchors[:3]))
-        else:
-            steps.append("CFA 从用户输入中提取上下文锚点，用于限定候选事实集合。")
+        # ---------------------------------------------------------------
+        # Direct disclosure: output directly contains protected fields.
+        # Not confirmation, not convergence.
+        # ---------------------------------------------------------------
+        if finding_type in ("direct_protected_disclosure", "direct_confidential_value_match"):
+            steps: List[str] = []
+            steps.append("CFA 检测模型输出中的受保护字段。")
+            if output_anchors:
+                steps.append("LLM 原始输出直接包含受保护字段值：" + "；".join(output_anchors[:4]))
+            if restored_fact:
+                steps.append("直接披露的受限字段：" + restored_fact)
+            else:
+                steps.append("模型输出直接命中了受保护的 secret_content 字段值。")
+            steps.append("该风险属于直接披露，不依赖候选收敛或信息增益。")
+            steps.append("最终答复由 CFA/本地保密闸门替换为安全答复。")
+            return steps
 
-        if output_anchors:
-            steps.append("LLM 原始输出新增确认/复述信号：" + "；".join(output_anchors[:4]))
-        else:
-            steps.append("LLM 原始输出提供了可参与组合还原的线索。")
+        # ---------------------------------------------------------------
+        # Confirmation: input uniquely identifies a fact, output echoes.
+        # ---------------------------------------------------------------
+        if finding_type == "input_hypothesis_confirmation":
+            steps: List[str] = []
+            steps.append("CFA 从用户输入中识别待确认的受限事实假设。")
+            if input_anchors:
+                steps.append("用户输入包含受限锚点：" + "；".join(input_anchors[:3]))
+            if output_anchors:
+                steps.append("模型输出对该假设形成确认或否定信号：" + "；".join(output_anchors[:4]))
+            if restored_fact:
+                steps.append("被模型确认的用户假设：" + restored_fact)
+            steps.append("最终答复由 CFA/本地保密闸门替换为安全答复。")
+            return steps
 
-        if finding.input_candidate_count or finding.final_candidate_count:
-            steps.append(
-                f"CFA 候选收敛：{finding.input_candidate_count or 0} → "
-                f"{finding.final_candidate_count or 0}，信息增益 "
-                f"{finding.information_gain_bits:.2f} bit。"
-            )
+        # ---------------------------------------------------------------
+        # Indirect restoration: output narrows candidate set.
+        # Only show convergence when final_count < input_count.
+        # ---------------------------------------------------------------
+        if finding_type in ("indirect_asset_restoration", "indirect_protected_value_restoration"):
+            steps: List[str] = []
+            steps.append("CFA 从用户输入中提取上下文锚点。")
+            if output_anchors:
+                steps.append("模型输出提供了可参与组合还原的线索：" + "；".join(output_anchors[:4]))
+            else:
+                steps.append("模型输出提供了可参与组合还原的线索。")
 
-        if restored_fact:
-            steps.append("被还原的受限事实：" + restored_fact)
-        steps.append("最终答复由 CFA/本地保密闸门替换为安全授权查询提示。")
-        return steps
+            # Only claim convergence when candidates actually shrink.
+            if 0 < final_count < input_count:
+                steps.append(
+                    f"CFA 候选集合由 {input_count} "
+                    f"缩小至 {final_count}，"
+                    f"信息增益 {info_gain:.2f} bit。"
+                )
+            elif input_count == final_count and input_count > 0:
+                steps.append(
+                    f"CFA 候选数量为 {input_count} → {final_count}，"
+                    f"信息增益为 {info_gain:.2f} bit，仅作为辅助统计，不作为风险依据。"
+                )
+
+            if restored_fact:
+                steps.append("组合还原的受限事实：" + restored_fact)
+            steps.append("最终答复由 CFA/本地保密闸门替换为安全答复。")
+            return steps
+
+        # ---------------------------------------------------------------
+        # Slot restoration
+        # ---------------------------------------------------------------
+        if finding_type == "input_output_slot_restoration":
+            steps: List[str] = []
+            steps.append("CFA 检测到输入-输出槽位补全模式。")
+            if input_anchors:
+                steps.append("用户输入提供了受限事实的槽位上下文：" + "；".join(input_anchors[:3]))
+            if output_anchors:
+                steps.append("模型输出补全了槽位值：" + "；".join(output_anchors[:4]))
+            if restored_fact:
+                steps.append("槽位补全还原的受限事实：" + restored_fact)
+            steps.append("最终答复由 CFA/本地保密闸门替换为安全答复。")
+            return steps
+
+        # Fallback
+        return ["CFA 检测到受限信息风险，最终答复已安全替换。"]
 
     @staticmethod
     def _format_restored_fact_for_evidence(
@@ -2069,6 +2172,71 @@ class CFAGateway:
         if not parts:
             parts.append("受控字段状态被间接还原")
         return f"{asset.display_name(policy.display_field)}：" + "，".join(parts)
+
+    @staticmethod
+    def _build_direct_confidential_score_breakdown(
+        policy: FieldPolicy,
+        *,
+        input_candidate_count: int,
+        final_candidate_count: int,
+        matched_fields: List[str],
+    ) -> Dict[str, Any]:
+        """Build CFA score components for deterministic local direct-hit findings."""
+        if final_candidate_count <= 0:
+            uniqueness_raw = 0.0
+        elif final_candidate_count <= policy.uniqueness_k:
+            uniqueness_raw = 1.0
+        else:
+            uniqueness_raw = 1.0 / final_candidate_count
+
+        match_weight = policy.match_type_weight("exact")
+        anchor_details = [
+            {
+                "anchor_id": f"local:{field_name}",
+                "field_name": field_name,
+                "field_label": policy.label(field_name),
+                "canonical_value": "",
+                "match_type": "exact",
+                "confidence": 1.0,
+                "match_type_weight": round(match_weight, 4),
+                "weighted_confidence": round(match_weight, 4),
+            }
+            for field_name in matched_fields
+        ]
+        anchor_confidence_raw = match_weight if anchor_details else 0.0
+        uniqueness_contribution = 25.0 * uniqueness_raw
+        confidence_contribution = 10.0 * min(1.0, anchor_confidence_raw)
+        final_score = min(100.0, 55.0 + uniqueness_contribution + confidence_contribution)
+
+        return {
+            "formula_version": "CFA-Score-v2.3",
+            "formula": "Base + 25×U + 15×G + 10×C",
+            "trigger_type": "direct_confidential_value_match",
+            "base": {"raw": 55.0, "contribution": 55.0},
+            "uniqueness": {
+                "input_candidate_count": input_candidate_count,
+                "final_candidate_count": final_candidate_count,
+                "uniqueness_k": policy.uniqueness_k,
+                "raw": round(uniqueness_raw, 4),
+                "weight": 25.0,
+                "contribution": round(uniqueness_contribution, 2),
+            },
+            "information_gain": {
+                "bits": 0.0,
+                "normalized": 0.0,
+                "normalization": "min(1, bits / 3)",
+                "weight": 15.0,
+                "contribution": 0.0,
+            },
+            "anchor_confidence": {
+                "raw": round(anchor_confidence_raw, 4),
+                "weight": 10.0,
+                "contribution": round(confidence_contribution, 2),
+                "anchors": anchor_details,
+            },
+            "final_score": round(final_score, 2),
+            "risk_thresholds": {"critical": 85, "high": 70, "medium": 45},
+        }
 
     def _build_direct_leak_findings(
         self,
@@ -2142,12 +2310,18 @@ class CFAGateway:
                 covered_by_existing_finding = True
                 continue
 
+            score_breakdown = self._build_direct_confidential_score_breakdown(
+                policy,
+                input_candidate_count=len(assets),
+                final_candidate_count=1,
+                matched_fields=sorted(set(matched_fields)),
+            )
             findings.append(
                 RiskFinding(
                     target_asset_id=asset.id,
                     target_asset_name=asset.display_name(policy.display_field),
                     risk_level="CRITICAL",
-                    score=100.0,
+                    score=score_breakdown["final_score"],
                     reason="模型输出直接包含保密库受保护字段值。",
                     restored_fact="",
                     anchors=[],
@@ -2159,16 +2333,23 @@ class CFAGateway:
                     input_candidate_count=len(assets),
                     final_candidate_count=1,
                     information_gain_bits=0.0,
+                    score_breakdown=score_breakdown,
                 )
             )
 
         if not findings and not covered_by_existing_finding:
+            score_breakdown = self._build_direct_confidential_score_breakdown(
+                policy,
+                input_candidate_count=len(assets),
+                final_candidate_count=1,
+                matched_fields=protected_fields,
+            )
             findings.append(
                 RiskFinding(
                     target_asset_id="",
                     target_asset_name="confidential_fact",
                     risk_level="CRITICAL",
-                    score=100.0,
+                    score=score_breakdown["final_score"],
                     reason="模型输出直接包含保密库受保护字段值。",
                     restored_fact="",
                     anchors=[],
@@ -2180,6 +2361,7 @@ class CFAGateway:
                     input_candidate_count=len(assets),
                     final_candidate_count=1,
                     information_gain_bits=0.0,
+                    score_breakdown=score_breakdown,
                 )
             )
         return findings
@@ -2350,6 +2532,100 @@ class CFAGateway:
         if scenario == "confidential":
             result["import_meta"] = self._read_confidential_import_meta()
         return result
+
+    def list_confidential_internal_kb(self) -> dict:
+        """管理员页面读取模拟内部知识库。"""
+        path = (
+            self._base_dir
+            / "config"
+            / "simulated_internal_kb_distributed.jsonl"
+        )
+
+        if not path.exists():
+            return {
+                "count": 0,
+                "records": [],
+                "errors": [],
+            }
+
+        records = []
+        errors = []
+
+        for line_no, line in enumerate(
+            path.read_text(encoding="utf-8-sig").splitlines(),
+            start=1,
+        ):
+            if not line.strip():
+                continue
+
+            try:
+                raw = json.loads(line)
+                if not isinstance(raw, dict):
+                    raise ValueError("该行不是 JSON object")
+
+                # 同时兼容两种内部知识库格式
+                kb_id = str(
+                    raw.get("kb_id")
+                    or raw.get("doc_id")
+                    or ""
+                ).strip()
+
+                if not kb_id:
+                    raise ValueError("缺少 kb_id/doc_id")
+
+                units = []
+
+                if isinstance(raw.get("content_units"), list):
+                    for item in raw["content_units"]:
+                        if not isinstance(item, dict):
+                            continue
+
+                        text = str(item.get("text") or "").strip()
+                        if not text:
+                            continue
+
+                        units.append({
+                            "unit_id": str(
+                                item.get("unit_id") or ""
+                            ).strip(),
+                            "role": str(
+                                item.get("role") or "content"
+                            ).strip(),
+                            "text": text,
+                        })
+
+                # 兼容当前 doc_id/title/content 格式
+                elif str(raw.get("content") or "").strip():
+                    units.append({
+                        "unit_id": "FULL",
+                        "role": "content",
+                        "text": str(raw["content"]).strip(),
+                    })
+
+                records.append({
+                    "kb_id": kb_id,
+                    "title": str(
+                        raw.get("topic")
+                        or raw.get("title")
+                        or kb_id
+                    ).strip(),
+                    "retrieval_terms": raw.get("retrieval_terms") or [],
+                    "content_units": units,
+                    "metadata": raw.get("metadata") or {},
+                    "source": raw.get("source") or "",
+                })
+
+            except Exception as exc:
+                errors.append({
+                    "line": line_no,
+                    "error": str(exc),
+                })
+
+        return {
+            "count": len(records),
+            "records": records,
+            "errors": errors,
+        }
 
     def add_protected_fact(self, scenario: str, fact: dict) -> dict:
         """Append a new fact to the scenario's facts JSON file.
@@ -2706,11 +2982,19 @@ def _build_response(
                 "target": f.target_asset_name or f.target_asset_id,
                 "target_id": f.target_asset_id,
                 "level": f.risk_level,
+                "risk_level": f.risk_level,
                 "score": f.score,
+                "score_breakdown": f.score_breakdown,
+                "finding_type": f.finding_type,
                 "reason": f.reason,
                 "restored": f.restored_fact,
                 "key_anchors": f.key_anchor_summary,
                 "chain": [s.to_dict() for s in f.reduction_chain],
+                "input_candidate_count": f.input_candidate_count,
+                "final_candidate_count": f.final_candidate_count,
+                "information_gain_bits": f.information_gain_bits,
+                "anchor_status": f.anchor_status,
+                "anchor_status_reason": f.anchor_status_reason,
             })
 
     return GatewayResponse(

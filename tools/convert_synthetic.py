@@ -1,6 +1,8 @@
 """
 Convert cfa_synthetic_examples/*.jsonl into config/confidential_assets.json
 and regenerate config/confidential_policy.json with fresh field_aliases.
+Also regenerate config/simulated_internal_kb_distributed.jsonl with the
+two-stage progressive-loading format (kb_id + content_units).
 
 Usage:
     python tools/convert_synthetic.py
@@ -11,6 +13,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 SYNTHETIC_DIR = ROOT / "cfa_synthetic_examples"
@@ -224,19 +227,122 @@ def generate_policy(assets: list[dict]) -> dict:
 # Step 3: Convert internal_kb.jsonl → simulated_internal_kb_distributed.jsonl
 # ---------------------------------------------------------------------------
 
-def convert_internal_kb(kb_records: list[dict]) -> list[dict]:
-    """Map internal_kb.jsonl to the distributed KB format used by the engine."""
-    distributed = []
-    for rec in kb_records:
-        distributed.append({
-            "doc_id": rec.get("doc_id", ""),
-            "title": rec.get("title", ""),
-            "content": rec.get("content", ""),
-            "metadata": rec.get("metadata", {}),
-            # The engine looks for these extra fields
-            "source": "synthetic_test",
+def _build_retrieval_terms(kb_rec: dict, secret_rec: dict | None) -> list[str]:
+    """Build retrieval_terms from KB metadata and matching secret keywords."""
+    terms: list[str] = []
+    seen: set[str] = set()
+
+    title = str(kb_rec.get("title", "") or "").strip()
+    meta = kb_rec.get("metadata", {}) or {}
+    department = str(meta.get("department", "")).strip()
+
+    # Terms from title (split on common delimiters)
+    for token in re.split(r"[0-9年月日\-—・·]+", title):
+        token = token.strip()
+        if len(token) >= 2 and token not in seen:
+            terms.append(token)
+            seen.add(token)
+
+    if department and department not in seen:
+        terms.append(department)
+        seen.add(department)
+
+    # Terms from secret_keywords (cross-reference with secret_library)
+    if secret_rec:
+        for kw in secret_rec.get("secret_keywords", []) or []:
+            kw = str(kw).strip()
+            if kw and len(kw) >= 2 and kw not in seen:
+                terms.append(kw)
+                seen.add(kw)
+
+    return terms[:20]
+
+
+def _split_content_into_units(content: str) -> list[dict[str, str]]:
+    """Split content text into content_units with roles.
+
+    Heuristic: each sentence becomes a unit.  First unit is background_context,
+    middle units with specific data are semantic_anchor_object, last unit is
+    response_boundary.
+    """
+    # Split on Chinese sentence delimiters
+    raw_parts = re.split(r"(?<=[。！？])", content)
+    parts = [p.strip() for p in raw_parts if p.strip()]
+    if not parts:
+        return [{"unit_id": "U1", "role": "content", "text": content.strip()}]
+
+    units: list[dict[str, str]] = []
+    # Detect sentences with specific data (numbers, measurements, names)
+    data_pattern = re.compile(r"[\d.]+|[百千万亿]元|TB|GB|分|台|次|人|个")
+
+    for i, part in enumerate(parts):
+        unit_id = f"U{i + 1}"
+        if i == 0:
+            role = "background_context"
+        elif i == len(parts) - 1:
+            role = "response_boundary"
+        elif data_pattern.search(part):
+            role = "semantic_anchor_object"
+        else:
+            role = "semantic_anchor_background"
+        units.append({
+            "unit_id": unit_id,
+            "role": role,
+            "text": part,
         })
+
+    return units
+
+
+def convert_internal_kb(kb_records: list[dict], secret_records: list[dict] | None = None) -> list[dict]:
+    """Map internal_kb.jsonl to the two-stage progressive-loading KB format.
+
+    Output matches what _coerce_confidential_distributed_kb_row() expects:
+        kb_id, topic, retrieval_terms, content_units[{unit_id, role, text}]
+    """
+    # Index secrets by title keywords for cross-referencing retrieval_terms
+    secret_index: dict[str, dict] = {}
+    if secret_records:
+        for sec in secret_records:
+            # Match KB title fragments to secret keywords
+            for kw in sec.get("secret_keywords", []) or []:
+                secret_index[str(kw).strip()] = sec
+
+    distributed: list[dict] = []
+    for rec in kb_records:
+        doc_id = str(rec.get("doc_id", "") or "").strip()
+        title = str(rec.get("title", "") or "").strip()
+        content = str(rec.get("content", "") or "").strip()
+        if not doc_id or not content:
+            continue
+
+        # Find matching secret record (heuristic: check if any secret keyword
+        # appears in the title or content)
+        best_secret: dict | None = None
+        best_score = 0
+        if secret_records:
+            for sec in secret_records:
+                score = 0
+                for kw in sec.get("secret_keywords", []) or []:
+                    kw = str(kw).strip()
+                    if kw and (kw in title or kw in content):
+                        score += 1
+                if score > best_score:
+                    best_score = score
+                    best_secret = sec
+
+        retrieval_terms = _build_retrieval_terms(rec, best_secret)
+        content_units = _split_content_into_units(content)
+
+        distributed.append({
+            "kb_id": doc_id,
+            "topic": title if title else "内部资料",
+            "retrieval_terms": retrieval_terms,
+            "content_units": content_units,
+        })
+
     return distributed
+
 
 # ---------------------------------------------------------------------------
 # Step 4: Generate simulated_internal_kb_distributed1.jsonl (split version)
@@ -254,7 +360,7 @@ def split_kb_for_distributed(kb_records: list[dict], chunk_size: int = 500) -> l
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
+def main() -> int:
     print("=== CFA Synthetic Data Converter ===")
     print()
 
@@ -288,14 +394,14 @@ def main():
         json.dump(policy, f, ensure_ascii=False, indent=2)
     print(f"Written policy to {policy_path}")
 
-    # Convert internal KB
+    # Convert internal KB → two-stage progressive format
     if kb_records:
-        distributed = convert_internal_kb(kb_records)
+        distributed = convert_internal_kb(kb_records, secrets)
         kb_dist_path = CONFIG_DIR / "simulated_internal_kb_distributed.jsonl"
         with open(kb_dist_path, "w", encoding="utf-8") as f:
             for rec in distributed:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        print(f"Written {len(distributed)} KB docs to {kb_dist_path}")
+        print(f"Written {len(distributed)} distributed KB docs to {kb_dist_path}")
 
         # Also create distributed1 (can be empty or split)
         kb_dist1_path = CONFIG_DIR / "simulated_internal_kb_distributed1.jsonl"
@@ -325,7 +431,8 @@ def main():
     print()
     print("Next steps:")
     print("  1. Review config/confidential_policy.json field_aliases")
-    print("  2. Run: python -m pytest tests/test_confidential_no_leak.py -v")
+    print("  2. Restart the service to clear the distributed KB cache")
+    print("  3. Run: python -m pytest tests/test_confidential_no_leak.py -v")
     return 0
 
 

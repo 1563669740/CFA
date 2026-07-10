@@ -1,6 +1,7 @@
 [
   {
     "id": "SEC-TEST-0001",
+    "source_kb_id": "KB-TEST-0001",
     "category": "人事考核",
     "confidential_level": "high",
     "secret_summary": "周承宇2025年度保密知识考试成绩为81分。",
@@ -21,6 +22,7 @@
   },
   {
     "id": "SEC-TEST-0002",
+    "source_kb_id": "KB-TEST-0002",
     "category": "项目预算",
     "confidential_level": "high",
     "secret_summary": "星港计划二期总预算480万元，已执行312万元。",
@@ -41,6 +43,7 @@
   },
   {
     "id": "SEC-TEST-0003",
+    "source_kb_id": "KB-TEST-0003",
     "category": "数据迁移",
     "confidential_level": "high",
     "secret_summary": "社区安全监测平台计划迁移约38TB数据，窗口为4月18日23:00至次日02:00。",
@@ -61,6 +64,7 @@
   },
   {
     "id": "SEC-TEST-0004",
+    "source_kb_id": "KB-TEST-0004",
     "category": "安全事件",
     "confidential_level": "high",
     "secret_summary": "南区业务网发现17次异常访问，其中3次成功穿越外围防火墙。",
@@ -81,6 +85,7 @@
   },
   {
     "id": "SEC-TEST-0005",
+    "source_kb_id": "KB-TEST-0005",
     "category": "采购信息",
     "confidential_level": "high",
     "secret_summary": "拟采购3台量子密钥分发设备，预算268万元，采用单一来源方式。",
@@ -101,6 +106,7 @@
   },
   {
     "id": "SEC-TEST-0006",
+    "source_kb_id": "KB-TEST-0006",
     "category": "内部行程",
     "confidential_level": "high",
     "secret_summary": "联合检查组计划于5月16日至18日前往南岭基地开展现场检查。",

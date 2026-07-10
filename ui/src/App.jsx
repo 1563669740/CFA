@@ -7,6 +7,7 @@ import {
   addProtectedFact,
   importConfidentialJsonl,
   fetchLastLlmPayload,
+  fetchConfidentialKb,
 } from './api';
 import DiffView from './DiffView';
 
@@ -66,6 +67,7 @@ const INTENT_LABELS = {
   domain_finance:    '💰 金融信贷',
   domain_aerospace:  '🛰️ 航天测控',
   domain_meetings:   '📋 会议室',
+  domain_confidential: '🔒 内部敏感查询',
   general_weather:   '🌤️ 天气查询',
   general_chat:      '💬 通用对话',
   ambiguous:         '❓ 意图不明',
@@ -297,12 +299,16 @@ function OutputSection({ loading, error, result }) {
                   </ol>
                 </div>
               )}
-              {Array.isArray(item.key_anchors) && item.key_anchors.length > 0 && (
-                <div className="evidence-anchors">
-                  <strong>关键锚点：</strong>
-                  {item.key_anchors.map((anchor, i2) => <span key={`${anchor}-${i2}`}>{anchor}</span>)}
-                </div>
-              )}
+              <div className="evidence-anchors">
+                <strong>关键锚点：</strong>
+                {Array.isArray(item.key_anchors) && item.key_anchors.length > 0 ? (
+                  item.key_anchors.map((anchor, i2) => <span key={`${anchor}-${i2}`}>{anchor}</span>)
+                ) : (
+                  <span className="empty-anchor">
+                    无{item.anchor_status_reason ? `——${item.anchor_status_reason}` : '——当前仅检测到受保护值泄露，尚未通过删除锚点反事实验证唯一还原。'}
+                  </span>
+                )}
+              </div>
               <div className="evidence-stats">
                 <span>输入候选：{item.input_candidate_count || 0}</span>
                 <span>最终候选：{item.final_candidate_count || 0}</span>
@@ -790,6 +796,7 @@ function ProtectedFactPanel({ currentScenario }) {
 function ConfidentialKbBrowser() {
   const [schema, setSchema] = useState(null);
   const [factsInfo, setFactsInfo] = useState(null);
+  const [internalKbInfo, setInternalKbInfo] = useState(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState('');
   const [query, setQuery] = useState('');
@@ -805,11 +812,16 @@ function ConfidentialKbBrowser() {
       setLoading(true);
       setErr('');
       try {
-        const schemaData = await fetchFactSchema('confidential');
-        const factsData = await fetchProtectedFacts('confidential');
+        const [schemaData, factsData, kbData] = await Promise.all([
+          fetchFactSchema('confidential'),
+          fetchProtectedFacts('confidential'),
+          fetchConfidentialKb(),
+        ]);
+
         if (!cancelled) {
           setSchema(schemaData);
           setFactsInfo(factsData);
+          setInternalKbInfo(kbData);
         }
       } catch (e) {
         if (!cancelled) setErr(e.message || '加载保密库失败');
@@ -827,6 +839,17 @@ function ConfidentialKbBrowser() {
   const facts = factsInfo?.facts || [];
   const fields = schema?.fields || [];
   const protectedFields = new Set(schema?.protected_fields || []);
+
+  const internalKbMap = useMemo(() => {
+    const records = internalKbInfo?.records || [];
+
+    return new Map(
+      records.map((record) => [
+        record.kb_id,
+        record,
+      ])
+    );
+  }, [internalKbInfo]);
 
   const categories = useMemo(() => {
     return Array.from(new Set(facts.map((f) => f.category || '未分类'))).sort();
@@ -872,13 +895,21 @@ function ConfidentialKbBrowser() {
         <div>
           <div className="fact-title">保密库浏览</div>
           <div className="fact-desc">
-            管理员/演示视图：这里展示导入的受保护事实。问答时这些原始事实不会整体注入 LLM，LLM 只接收后端生成的脱敏安全摘要。
+            管理员/演示视图：此处同时展示 CFA 检测事实及其对应内部知识库。
+            问答时第一阶段只发送知识库目录，第二阶段只发送模型选中的
+            content_units，不会整体发送全部内部知识库。
           </div>
         </div>
         <div className="kb-stat-card">
           <span>当前事实</span>
           <strong>{factsInfo?.count ?? 0}</strong>
         </div>
+        {internalKbInfo && (
+          <div className="kb-stat-card" style={{ marginLeft: 8 }}>
+            <span>内部知识库文档</span>
+            <strong>{internalKbInfo.count ?? 0}</strong>
+          </div>
+        )}
       </div>
 
       {factsInfo?.import_meta && (
@@ -936,6 +967,11 @@ function ConfidentialKbBrowser() {
             <tbody>
               {filteredFacts.map((fact, idx) => {
                 const rowKey = fact.id || `row-${idx}`;
+
+                const relatedKb = fact.source_kb_id
+                  ? internalKbMap.get(fact.source_kb_id)
+                  : null;
+
                 return (
                   <tr key={rowKey}>
                     <td>
@@ -949,8 +985,55 @@ function ConfidentialKbBrowser() {
                         <div className="kb-row-detail">
                           <div><strong>攻击改写：</strong>{formatFactValue(fact.attack_paraphrases) || '-'}</div>
                           <div><strong>负样本：</strong>{formatFactValue(fact.negative_samples) || '-'}</div>
+
+                          <div className="related-internal-kb">
+                            <div className="related-kb-title">
+                              <strong>对应内部知识库：</strong>
+                              {relatedKb
+                                ? `${relatedKb.title}（${relatedKb.kb_id}）`
+                                : '未建立关联'}
+                            </div>
+
+                            {relatedKb && (
+                              <>
+                                <div className="related-kb-meta">
+                                  部门：
+                                  {relatedKb.metadata?.department || '-'}
+                                  {'；'}
+                                  日期：
+                                  {relatedKb.metadata?.date || '-'}
+                                </div>
+
+                                <div className="related-kb-units">
+                                  {(relatedKb.content_units || []).map((unit) => (
+                                    <div
+                                      className="related-kb-unit"
+                                      key={`${relatedKb.kb_id}-${unit.unit_id}`}
+                                    >
+                                      <div>
+                                        <strong>
+                                          {unit.unit_id || '内容单元'}
+                                        </strong>
+                                        {unit.role && ` · ${unit.role}`}
+                                      </div>
+
+                                      <div>{unit.text}</div>
+                                    </div>
+                                  ))}
+                                </div>
+
+                                <details>
+                                  <summary>查看内部知识库原始结构</summary>
+                                  <pre>
+                                    {JSON.stringify(relatedKb, null, 2)}
+                                  </pre>
+                                </details>
+                              </>
+                            )}
+                          </div>
+
                           <details>
-                            <summary>查看原始 JSON</summary>
+                            <summary>查看保密事实原始 JSON</summary>
                             <pre>{JSON.stringify(fact, null, 2)}</pre>
                           </details>
                         </div>

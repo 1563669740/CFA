@@ -103,6 +103,20 @@ export async function addProtectedFact({ scenario, fact }) {
   return res.json();
 }
 
+/** GET /api/confidential-kb */
+export async function fetchConfidentialKb() {
+  const res = await fetch(`${BASE}/confidential-kb`);
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(
+      err.error || `HTTP ${res.status}`
+    );
+  }
+
+  return res.json();
+}
+
 /** GET /api/debug/last-llm-payload */
 export async function fetchLastLlmPayload({ requestId, purpose } = {}) {
   const params = new URLSearchParams();

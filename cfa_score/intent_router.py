@@ -59,7 +59,8 @@ _HEALTHCARE_PATTERNS: List[Tuple[str, float]] = [
     (r"医保|社保|自费|报销|结算|缴费|住院费|门诊费", 0.85),
     (r"病区|科室|病房|床位|护理|护士站", 0.85),
     (r"病史|既往史|过敏史|家族史|个人史", 0.90),
-    (r"化验|检查|CT|MRI|X光|B超|心电图|血常规|尿常规", 0.85),
+    (r"化验|体检|医学检查|身体检查|影像检查|"
+     r"CT|MRI|X光|B超|心电图|血常规|尿常规", 0.85),
     (r"手术|术后|术前|麻醉|切口|拆线|换药", 0.85),
     (r"抗凝|降压|降糖|降脂|抗生素|激素|化疗|放疗", 0.85),
     (r"急性|慢性|心肌梗死|心梗|脑梗|脑出血|肺炎|糖尿病|高血压|冠心病", 0.90),
@@ -138,6 +139,14 @@ def classify_intent(text: str) -> Intent:
 
     text_lower = text.lower()
 
+    # ---- 上下文判断：避免“联合检查组”“安全检查”等非医学“检查”触发医疗领域 ----
+    _MEDICAL_CONTEXT = re.compile(
+        r"医院|医生|患者|病人|门诊|住院|病房|科室|诊断|治疗|体检"
+    )
+    _has_medical_context_for_check = (
+        "检查" in text_lower and _MEDICAL_CONTEXT.search(text_lower)
+    )
+
     # Score each domain
     scores: List[Tuple[str, float, List[str]]] = []
 
@@ -159,6 +168,16 @@ def classify_intent(text: str) -> Intent:
                 domain_score = 1.0 - (1.0 - domain_score) * (1.0 - weight)
         if domain_score > 0:
             scores.append((domain, domain_score, matched_kws))
+
+    # Context-aware "检查" check: only boost healthcare if medical context exists
+    if _has_medical_context_for_check:
+        healthcare_entry = next((s for s in scores if s[0] == DOMAIN_HEALTHCARE), None)
+        if healthcare_entry:
+            idx = scores.index(healthcare_entry)
+            boosted = 1.0 - (1.0 - healthcare_entry[1]) * (1.0 - 0.75)
+            scores[idx] = (DOMAIN_HEALTHCARE, min(1.0, boosted), healthcare_entry[2] + ["检查(医学上下文)"])
+        else:
+            scores.append((DOMAIN_HEALTHCARE, 0.75, ["检查(医学上下文)"]))
 
     # Special case: if weather keywords exist AND a time keyword exists,
     # boost weather confidence significantly

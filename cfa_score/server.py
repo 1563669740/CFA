@@ -75,6 +75,8 @@ class _CFAHandler(BaseHTTPRequestHandler):
             self._fact_schema(parsed)
         elif path == "/api/protected-facts":
             self._list_protected_facts(parsed)
+        elif path == "/api/confidential-kb":
+            self._list_confidential_kb()
         elif path == "/api/debug/last-llm-payload":
             self._debug_last_llm_payload(parsed)
         else:
@@ -208,6 +210,16 @@ class _CFAHandler(BaseHTTPRequestHandler):
             self._respond(400, {"error": str(exc)})
         except Exception as exc:
             self._respond(500, {"error": f"list facts error: {exc}"})
+
+    def _list_confidential_kb(self) -> None:
+        try:
+            data = self.gateway.list_confidential_internal_kb()
+            self._respond(200, data)
+        except Exception as exc:
+            self._respond(
+                500,
+                {"error": f"list confidential kb error: {exc}"},
+            )
 
     def _add_protected_fact(self) -> None:
         body = self._read_json()

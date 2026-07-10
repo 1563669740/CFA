@@ -28,6 +28,8 @@ report.json
 
 # Debug / runtime logs
 logs/
+.codex_tmp_ssh_venv/
+tests/_test_debug_request_id/
 
 # Binary / document files
 *.docx

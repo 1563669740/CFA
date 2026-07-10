@@ -482,6 +482,11 @@ class RiskFinding:
     input_candidate_count: int = 0
     final_candidate_count: int = 0
     information_gain_bits: float = 0.0
+    score_breakdown: Dict[str, Any] = field(default_factory=dict)
+
+    # -------- v2.8: Anchor verification status --------
+    anchor_status: str = ""  # "" | "unique_restoration_not_verified" | "unique_restoration_verified"
+    anchor_status_reason: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)

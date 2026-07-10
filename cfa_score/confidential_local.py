@@ -86,12 +86,40 @@ class ConfidentialLocalService:
         }
 
     def retrieve(self, text: str, top_k: int = 5) -> List[LocalMatch]:
-        """本地关键词/内容匹配检索，返回 top_k 结果。"""
+        """本地关键词/内容匹配检索，返回 top_k 结果。
+
+        Applies a strong penalty when the query matches an asset's
+        ``negative_samples`` — those are explicitly designated as
+        general-knowledge / off-target questions that should NOT
+        retrieve this confidential record (e.g. "保密知识考试通常考哪些内容？").
+        """
         results: List[LocalMatch] = []
 
         for asset in self.assets:
             score = 0.0
             matched_fields: List[str] = []
+
+            # -----------------------------------------------------------
+            # Negative-sample gate: if the query closely matches a
+            # negative_sample, this asset should be strongly demoted.
+            # -----------------------------------------------------------
+            negative_penalty = 0.0
+            negative_samples = asset.extra.get("negative_samples", [])
+            if isinstance(negative_samples, list) and negative_samples:
+                for neg_text in negative_samples:
+                    neg_text = str(neg_text).strip()
+                    if neg_text and self._match_score(text, self._normalize(neg_text)) >= 1.5:
+                        # Strong penalty: the query is explicitly labeled
+                        # as "not this record".  The penalty must be large
+                        # enough to push the score below zero so the asset
+                        # is excluded from results.
+                        negative_penalty += 6.0
+            if negative_penalty > 0:
+                # Still record the match but with a deeply negative score
+                # so it will never appear in the top results.
+                score -= negative_penalty
+                # We still continue scoring to fill matched_fields for
+                # audit purposes, but do not exit early.
 
             # 字段权重匹配
             for field_name, weight in self._field_weights().items():
@@ -127,6 +155,10 @@ class ConfidentialLocalService:
             if summary_score > 0:
                 matched_fields.append("secret_summary")
             score += summary_score
+
+            # negative penalty is applied AFTER all scoring so that
+            # its magnitude consistently overrides any false positives.
+            score -= negative_penalty
 
             if score > 0:
                 results.append(

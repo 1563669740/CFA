@@ -1093,6 +1093,39 @@ body {
   font-size: 0.72rem;
 }
 
+.related-internal-kb {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid #b8c8ef;
+  border-radius: 8px;
+  background: #f5f8ff;
+}
+
+.related-kb-title {
+  margin-bottom: 8px;
+  color: #294b96;
+}
+
+.related-kb-meta {
+  margin-bottom: 8px;
+  color: #667085;
+  font-size: 13px;
+}
+
+.related-kb-unit {
+  margin-top: 8px;
+  padding: 9px 10px;
+  border-left: 3px solid #597ef7;
+  background: #ffffff;
+  line-height: 1.55;
+}
+
+.related-internal-kb pre {
+  max-height: 360px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
 .masked-value,
 .dim-text {
   color: var(--text-dim);

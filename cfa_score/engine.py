@@ -765,6 +765,42 @@ class CFAScoreEngine:
     # v2.3 — Minimal restoration combination search
     # ==================================================================
 
+    def _combo_restores_unique_fact(
+        self,
+        combo: list[Anchor],
+        target_asset: AssetFact,
+        restored_field: str,
+        anchor_by_id: Dict[str, Anchor],
+    ) -> bool:
+        """Check whether a combo restores a unique fact.
+
+        The combo must:
+        1. Contain at least one output anchor that covers the protected field.
+        2. Narrow the full fact universe to exactly the target_asset.
+        """
+        # Must have an output anchor providing the protected field value
+        disclosure_anchors = [
+            anchor
+            for anchor in combo
+            if anchor.source == "output"
+            and anchor.protected
+            and anchor.field_name == restored_field
+            and not anchor.inferred
+        ]
+        if not disclosure_anchors:
+            return False
+
+        candidates = self._filter_candidates(
+            list(self.assets),
+            combo,
+            anchor_by_id,
+        )
+
+        return (
+            len(candidates) == 1
+            and candidates[0].id == target_asset.id
+        )
+
     def _minimal_restoration_combinations(
         self,
         input_anchors: list[Anchor],
@@ -777,10 +813,15 @@ class CFAScoreEngine:
     ) -> list[list[Anchor]]:
         """
         Find inclusion-minimal anchor combinations that are sufficient to trigger
-        the same restoration decision.
+        the same restoration decision, AND pass counterfactual necessity:
+        removing any single anchor from the combo must break the unique binding.
 
         A valid combination must contain at least one output anchor, otherwise the
         risk is caused by user input alone and should not be attributed to model output.
+
+        v2.8: Removed the direct_protected_disclosure shortcut.  Every minimal
+        combo must now pass the counterfactual necessity check — the combo
+        restores a unique fact, but dropping any single member no longer does.
         """
 
         usable_inputs = [
@@ -796,14 +837,54 @@ class CFAScoreEngine:
         if not usable_outputs:
             return []
 
-        # Direct protected disclosure is special:
-        # each directly disclosed protected output anchor is itself a minimal combo.
+        # For direct disclosure, we build a target_asset and restored_field
+        # from the output anchors so we can run counterfactual checks.
+        target_asset: Optional[AssetFact] = None
+        restored_field: str = ""
+
         if decision.trigger_type == "direct_protected_disclosure":
-            return [
-                [a]
-                for a in usable_outputs
-                if a.protected
-            ][:max_results]
+            protected_outputs = [a for a in usable_outputs if a.protected]
+            if not protected_outputs:
+                return []
+            # Try to bind to a single asset via all protected outputs
+            for asset in self.assets:
+                matches = self._anchors_matching_asset(asset, protected_outputs, anchor_by_id)
+                if len(matches) == len(protected_outputs):
+                    target_asset = asset
+                    break
+            if target_asset is None:
+                # No single asset matches all protected outputs —
+                # still try per-anchor binding.
+                for anchor in protected_outputs:
+                    for asset in self.assets:
+                        if self._asset_matches_anchor_with_id(asset, anchor, anchor_by_id):
+                            target_asset = asset
+                            restored_field = anchor.field_name
+                            break
+                    if target_asset is not None:
+                        break
+            else:
+                restored_field = protected_outputs[0].field_name
+        else:
+            # For indirect restoration, find target from final_candidates
+            input_candidates = self._filter_candidates(
+                list(self.assets),
+                usable_inputs,
+                anchor_by_id,
+            )
+            final_candidates = self._filter_candidates(
+                input_candidates,
+                usable_outputs,
+                anchor_by_id,
+            )
+            if len(final_candidates) == 1:
+                target_asset = final_candidates[0]
+                restored_field = decision.restored_fields[0] if decision.restored_fields else ""
+
+        if target_asset is None or not restored_field:
+            # Fall back to pre-v2.8 behavior for indirect restoration
+            # where we can't pin a single target asset
+            pass
 
         pool = usable_inputs + usable_outputs
         output_ids = {a.id for a in usable_outputs}
@@ -827,16 +908,33 @@ class CFAScoreEngine:
                 if any(prev.issubset(combo_ids) for prev in minimal_id_sets):
                     continue
 
-                if self._combo_triggers_same_restoration(
+                if not self._combo_triggers_same_restoration(
                     combo,
                     anchor_by_id,
                     decision,
                 ):
-                    minimal.append(combo)
-                    minimal_id_sets.append(combo_ids)
+                    continue
 
-                    if len(minimal) >= max_results:
-                        return minimal
+                # v2.8: Counterfactual necessity check.
+                # When a target_asset is available, verify that removing *any*
+                # single anchor from the combo breaks the unique binding.
+                if target_asset is not None and restored_field:
+                    if not all(
+                        not self._combo_restores_unique_fact(
+                            [item for item in combo if item.id != anchor.id],
+                            target_asset,
+                            restored_field,
+                            anchor_by_id,
+                        )
+                        for anchor in combo
+                    ):
+                        continue
+
+                minimal.append(combo)
+                minimal_id_sets.append(combo_ids)
+
+                if len(minimal) >= max_results:
+                    return minimal
 
         return minimal
 
@@ -888,6 +986,25 @@ class CFAScoreEngine:
 
         input_count = len(input_candidates)
         final_count = len(final_candidates)
+
+        if decision.trigger_type == "direct_protected_disclosure":
+            # For direct disclosure, output must contain at least one
+            # protected anchor, and the combo must produce a unique result
+            # (or narrow to ≤k) to prove the disclosure matters.
+            has_protected_output = any(
+                a.protected and not a.inferred
+                for a in combo_outputs
+            )
+            if not has_protected_output:
+                return False
+            # Must narrow to ≤k unique candidates.  When input was already 1,
+            # the disclosure is real but its "uniqueness" is not attributable
+            # to the output alone — that determination is made later by the
+            # counterfactual necessity check.
+            return (
+                final_count <= self.policy.uniqueness_k
+                and final_count < input_count
+            )
 
         # Output must actually reduce the candidate set.
         # Otherwise the restoration is already caused by user input alone.
@@ -947,46 +1064,112 @@ class CFAScoreEngine:
     # v2.3 — Scoring for indirect restoration
     # ==================================================================
 
+    def _build_score_breakdown(
+        self,
+        snapshot: CandidateSnapshot,
+        decision: RestorationDecision,
+    ) -> dict:
+        """Compute CFA-Score and expose every weighted scoring component."""
+        input_count = len(snapshot.input_candidates)
+        final_count = len(snapshot.final_candidates)
+
+        if decision.trigger_type in (
+            "direct_protected_disclosure",
+            "direct_confidential_value_match",
+            "input_hypothesis_confirmation",
+            "input_output_slot_restoration",
+        ):
+            base_score = 55.0
+        elif decision.trigger_type == "indirect_asset_restoration":
+            base_score = 50.0
+        else:
+            base_score = 40.0
+
+        if final_count <= 0:
+            uniqueness_raw = 0.0
+        elif final_count <= self.policy.uniqueness_k:
+            uniqueness_raw = 1.0
+        else:
+            uniqueness_raw = 1.0 / final_count
+
+        gain_raw = min(1.0, max(0.0, snapshot.information_gain_bits) / 3.0)
+
+        anchor_confidence_raw = 0.0
+        anchor_details = []
+        if snapshot.contributing_output_anchors:
+            weighted_values = []
+            for anchor in snapshot.contributing_output_anchors:
+                match_weight = self.policy.match_type_weight(anchor.match_type)
+                weighted_confidence = anchor.confidence * match_weight
+                weighted_values.append(weighted_confidence)
+                anchor_details.append({
+                    "anchor_id": anchor.id,
+                    "field_name": anchor.field_name,
+                    "field_label": anchor.field_label,
+                    "canonical_value": anchor.effective_canonical_value(),
+                    "match_type": anchor.match_type,
+                    "confidence": round(anchor.confidence, 4),
+                    "match_type_weight": round(match_weight, 4),
+                    "weighted_confidence": round(weighted_confidence, 4),
+                })
+            anchor_confidence_raw = sum(weighted_values) / len(weighted_values)
+
+        uniqueness_contribution = 25.0 * uniqueness_raw
+        gain_contribution = 15.0 * gain_raw
+        confidence_contribution = 10.0 * min(1.0, anchor_confidence_raw)
+        final_score = min(
+            100.0,
+            base_score
+            + uniqueness_contribution
+            + gain_contribution
+            + confidence_contribution,
+        )
+
+        return {
+            "formula_version": "CFA-Score-v2.3",
+            "formula": "Base + 25×U + 15×G + 10×C",
+            "trigger_type": decision.trigger_type,
+            "base": {
+                "raw": base_score,
+                "contribution": base_score,
+            },
+            "uniqueness": {
+                "input_candidate_count": input_count,
+                "final_candidate_count": final_count,
+                "uniqueness_k": self.policy.uniqueness_k,
+                "raw": round(uniqueness_raw, 4),
+                "weight": 25.0,
+                "contribution": round(uniqueness_contribution, 2),
+            },
+            "information_gain": {
+                "bits": round(snapshot.information_gain_bits, 4),
+                "normalized": round(gain_raw, 4),
+                "normalization": "min(1, bits / 3)",
+                "weight": 15.0,
+                "contribution": round(gain_contribution, 2),
+            },
+            "anchor_confidence": {
+                "raw": round(anchor_confidence_raw, 4),
+                "weight": 10.0,
+                "contribution": round(confidence_contribution, 2),
+                "anchors": anchor_details,
+            },
+            "final_score": round(final_score, 2),
+            "risk_thresholds": {
+                "critical": 85,
+                "high": 70,
+                "medium": 45,
+            },
+        }
+
     def _score_restoration(
         self,
         snapshot: CandidateSnapshot,
         decision: RestorationDecision,
     ) -> float:
         """Compute CFA-Score with indirect-restoration awareness."""
-        input_count = len(snapshot.input_candidates)
-        final_count = len(snapshot.final_candidates)
-        if final_count <= 0:
-            return 0.0
-
-        uniqueness_score = (
-            1.0
-            if final_count <= self.policy.uniqueness_k
-            else 1.0 / final_count
-        )
-        gain_score = min(1.0, snapshot.information_gain_bits / 3.0)
-
-        # Average output anchor confidence
-        output_confidence = 0.0
-        if snapshot.contributing_output_anchors:
-            output_confidence = sum(
-                a.confidence * self.policy.match_type_weight(a.match_type)
-                for a in snapshot.contributing_output_anchors
-            ) / len(snapshot.contributing_output_anchors)
-
-        if decision.trigger_type == "direct_protected_disclosure":
-            base = 55.0
-        elif decision.trigger_type == "indirect_asset_restoration":
-            base = 50.0
-        else:
-            base = 40.0
-
-        score = (
-            base
-            + 25.0 * uniqueness_score
-            + 15.0 * gain_score
-            + 10.0 * min(1.0, output_confidence)
-        )
-        return round(min(100.0, score), 2)
+        breakdown = self._build_score_breakdown(snapshot, decision)
+        return breakdown["final_score"]
 
     def _risk_level(self, score: float) -> str:
         if score >= 85:
@@ -1036,6 +1219,10 @@ class CFAScoreEngine:
             decision,
         )
 
+        # v2.8: Determine anchor verification status
+        anchor_status = ""
+        anchor_status_reason = ""
+
         if minimal_combos:
             minimal_combinations = [
                 [a.id for a in combo]
@@ -1060,6 +1247,8 @@ class CFAScoreEngine:
                 if a.source == "output"
             ]
 
+            anchor_status = "unique_restoration_verified"
+
         else:
             # Fallback: keep old behavior only if minimal search fails.
             # This prevents breaking existing demo behavior.
@@ -1074,6 +1263,25 @@ class CFAScoreEngine:
             key_summary_dedup = self._summarize_key_anchors(key_anchors)
 
             key_output_anchors = list(snapshot.contributing_output_anchors)
+
+            # v2.8: When direct_protected_disclosure is detected but no
+            # minimal combos pass counterfactual verification, flag it.
+            if decision.trigger_type == "direct_protected_disclosure":
+                anchor_status = "unique_restoration_not_verified"
+                input_count = len(snapshot.input_candidates)
+                final_count = len(snapshot.final_candidates)
+                if input_count <= 1 and final_count <= 1:
+                    anchor_status_reason = (
+                        f"加入模型输出前候选已经为 {input_count} 条；加入输出后仍为 "
+                        f"{final_count} 条，信息增益为 "
+                        f"{snapshot.information_gain_bits:.2f} bit，"
+                        f"无法证明任何锚点导致了唯一化。"
+                    )
+                else:
+                    anchor_status_reason = (
+                        f"检测到受保护值泄露，但未通过删除锚点反事实验证唯一还原。"
+                        f"输入候选 {input_count} 条，最终候选 {final_count} 条。"
+                    )
 
         # When final_candidates is empty but detection triggered (e.g.
         # direct disclosure), use input_candidates count for scoring
@@ -1094,11 +1302,13 @@ class CFAScoreEngine:
             information_gain_bits=effective_ig,
         )
 
+        score_breakdown = self._build_score_breakdown(effective_snapshot, decision)
+        score = score_breakdown["final_score"]
+
         for asset in target_assets:
             matching_anchors = self._anchors_matching_asset(asset, key_anchors, anchor_by_id)
             chain = self._reduction_chain(matching_anchors, anchor_by_id)
 
-            score = self._score_restoration(effective_snapshot, decision)
             level = self._risk_level(score)
             if level == "LOW":
                 continue
@@ -1124,6 +1334,9 @@ class CFAScoreEngine:
                     input_candidate_count=len(snapshot.input_candidates),
                     final_candidate_count=len(snapshot.final_candidates),
                     information_gain_bits=snapshot.information_gain_bits,
+                    score_breakdown=score_breakdown,
+                    anchor_status=anchor_status,
+                    anchor_status_reason=anchor_status_reason,
                 )
             )
 
@@ -1611,6 +1824,13 @@ class CFAScoreEngine:
             if a.protected and not a.inferred
         ]
         if protected_output:
+            direct_input_candidates = self._filter_candidates_by_context_anchors(
+                claim.context_anchors,
+                anchor_by_id,
+            )
+            if not direct_input_candidates:
+                direct_input_candidates = list(self.assets)
+
             # Direct disclosure: build an aggregate finding when one claim binds to one
             # concrete asset, then keep per-anchor findings for field-level redaction.
             if len(claim.candidate_assets) == 1:
@@ -1622,10 +1842,25 @@ class CFAScoreEngine:
                 )
                 aggregate_fields = sorted({a.field_name for a in aggregate_anchors if a.protected})
                 if len(aggregate_fields) >= 2:
-                    aggregate_score = min(
-                        100.0,
-                        max(self._score_direct_disclosure(a) for a in aggregate_anchors) + 5.0,
+                    aggregate_decision = RestorationDecision(
+                        detected=True,
+                        trigger_type="direct_protected_disclosure",
+                        restored_fields=aggregate_fields,
+                        reason="模型输出直接包含多项受限字段信息。",
                     )
+                    aggregate_snapshot = CandidateSnapshot(
+                        input_candidates=direct_input_candidates,
+                        final_candidates=[aggregate_asset],
+                        input_anchors=list(claim.context_anchors),
+                        output_anchors=list(protected_output),
+                        contributing_output_anchors=list(aggregate_anchors),
+                        information_gain_bits=0.0,
+                    )
+                    aggregate_breakdown = self._build_score_breakdown(
+                        aggregate_snapshot,
+                        aggregate_decision,
+                    )
+                    aggregate_score = aggregate_breakdown["final_score"]
                     findings.append(
                         RiskFinding(
                             target_asset_id=aggregate_asset.id,
@@ -1642,19 +1877,15 @@ class CFAScoreEngine:
                             finding_type="direct_protected_disclosure",
                             target_asset_ids=[aggregate_asset.id],
                             restored_fields=aggregate_fields,
-                            input_candidate_count=len(self.assets),
+                            input_candidate_count=len(direct_input_candidates),
                             final_candidate_count=1,
                             information_gain_bits=0.0,
+                            score_breakdown=aggregate_breakdown,
                         )
                     )
 
             # Direct disclosure: findings per protected anchor
             for anchor in protected_output:
-                score = self._score_direct_disclosure(anchor)
-                level = self._risk_level(score)
-                if level == "LOW":
-                    continue
-
                 # Try to bind to a candidate asset if possible
                 target_asset = None
                 if claim.candidate_assets:
@@ -1676,6 +1907,28 @@ class CFAScoreEngine:
                 target_ids = [a.id for a in claim.candidate_assets] if claim.candidate_assets else []
                 if target_asset:
                     target_ids = [target_asset.id]
+                direct_final_candidates = [target_asset] if target_asset else list(claim.candidate_assets)
+                if not direct_final_candidates:
+                    direct_final_candidates = list(direct_input_candidates)
+                direct_decision = RestorationDecision(
+                    detected=True,
+                    trigger_type="direct_protected_disclosure",
+                    restored_fields=protected_field_names,
+                    reason=f"模型输出直接包含受限字段: {anchor.field_label}={anchor.effective_canonical_value()}",
+                )
+                direct_snapshot = CandidateSnapshot(
+                    input_candidates=direct_input_candidates,
+                    final_candidates=direct_final_candidates,
+                    input_anchors=list(claim.context_anchors),
+                    output_anchors=list(protected_output),
+                    contributing_output_anchors=[anchor],
+                    information_gain_bits=0.0,
+                )
+                direct_breakdown = self._build_score_breakdown(direct_snapshot, direct_decision)
+                score = direct_breakdown["final_score"]
+                level = self._risk_level(score)
+                if level == "LOW":
+                    continue
 
                 findings.append(
                     RiskFinding(
@@ -1693,9 +1946,10 @@ class CFAScoreEngine:
                         finding_type="direct_protected_disclosure",
                         target_asset_ids=target_ids,
                         restored_fields=protected_field_names,
-                        input_candidate_count=len(self.assets),
-                        final_candidate_count=len(claim.candidate_assets),
+                        input_candidate_count=len(direct_input_candidates),
+                        final_candidate_count=len(direct_final_candidates),
                         information_gain_bits=0.0,
+                        score_breakdown=direct_breakdown,
                     )
                 )
             if findings:
@@ -1748,12 +2002,14 @@ class CFAScoreEngine:
                 reason=f"模型输出新增线索将候选从 {input_count} 条压缩至 {final_count} 条，信息增益为 {ig:.2f} bit。",
             )
 
+            score_breakdown = self._build_score_breakdown(snapshot, decision)
+            score = score_breakdown["final_score"]
+
             for asset in final_candidates:
                 matching = self._anchors_matching_asset(
                     asset, claim.local_output_anchors, anchor_by_id
                 )
                 chain = self._reduction_chain(matching, anchor_by_id)
-                score = self._score_restoration(snapshot, decision)
                 level = self._risk_level(score)
                 if level == "LOW":
                     continue
@@ -1776,6 +2032,7 @@ class CFAScoreEngine:
                         input_candidate_count=input_count,
                         final_candidate_count=final_count,
                         information_gain_bits=ig,
+                        score_breakdown=score_breakdown,
                     )
                 )
             return findings
@@ -1784,26 +2041,28 @@ class CFAScoreEngine:
         before_set = input_candidates or list(self.assets)
         restored_fields = self._find_restored_protected_fields(before_set, final_candidates)
         if restored_fields:
+            snapshot = CandidateSnapshot(
+                input_candidates=before_set,
+                final_candidates=final_candidates,
+                input_anchors=list(claim.context_anchors),
+                output_anchors=list(claim.local_output_anchors),
+                contributing_output_anchors=list(claim.local_output_anchors),
+                information_gain_bits=ig,
+            )
+            decision = RestorationDecision(
+                detected=True,
+                trigger_type="indirect_protected_value_restoration",
+                restored_fields=restored_fields,
+                reason="模型输出使部分受限字段收敛到安全阈值以内。",
+            )
+            score_breakdown = self._build_score_breakdown(snapshot, decision)
+            score = score_breakdown["final_score"]
+
             for asset in final_candidates:
                 matching = self._anchors_matching_asset(
                     asset, claim.local_output_anchors, anchor_by_id
                 )
                 chain = self._reduction_chain(matching, anchor_by_id)
-                snapshot = CandidateSnapshot(
-                    input_candidates=before_set,
-                    final_candidates=final_candidates,
-                    input_anchors=list(claim.context_anchors),
-                    output_anchors=list(claim.local_output_anchors),
-                    contributing_output_anchors=list(claim.local_output_anchors),
-                    information_gain_bits=ig,
-                )
-                decision = RestorationDecision(
-                    detected=True,
-                    trigger_type="indirect_protected_value_restoration",
-                    restored_fields=restored_fields,
-                    reason="模型输出使部分受限字段收敛到安全阈值以内。",
-                )
-                score = self._score_restoration(snapshot, decision)
                 level = self._risk_level(score)
                 if level == "LOW":
                     continue
@@ -1826,6 +2085,7 @@ class CFAScoreEngine:
                         input_candidate_count=input_count,
                         final_candidate_count=final_count,
                         information_gain_bits=ig,
+                        score_breakdown=score_breakdown,
                     )
                 )
             return findings
@@ -1921,7 +2181,22 @@ class CFAScoreEngine:
         )
 
         total_count = max(1, len(self.assets))
-        score = 92.0
+        confirmation_snapshot = CandidateSnapshot(
+            input_candidates=list(self.assets),
+            final_candidates=[target_asset],
+            input_anchors=list(chain_anchors),
+            output_anchors=[output_anchor] if output_anchor is not None else [],
+            contributing_output_anchors=[output_anchor] if output_anchor is not None else [],
+            information_gain_bits=round(math.log2(total_count), 4) if total_count > 1 else 0.0,
+        )
+        confirmation_decision = RestorationDecision(
+            detected=True,
+            trigger_type="input_hypothesis_confirmation",
+            restored_fields=restored_fields,
+            reason="用户输入已唯一指向受限事实，模型输出又确认或复述该事实的核心内容。",
+        )
+        score_breakdown = self._build_score_breakdown(confirmation_snapshot, confirmation_decision)
+        score = score_breakdown["final_score"]
         key_summary = self._summarize_key_anchors(matching_protected)
         key_summary.extend(f"模型输出/确认信号:{signal}" for signal in signals[:4])
         if output_anchor is not None:
@@ -1948,6 +2223,7 @@ class CFAScoreEngine:
             input_candidate_count=total_count,
             final_candidate_count=1,
             information_gain_bits=round(math.log2(total_count), 4) if total_count > 1 else 0.0,
+            score_breakdown=score_breakdown,
         )
         return [finding]
 
@@ -2162,7 +2438,22 @@ class CFAScoreEngine:
             finding_anchors.append(slot_anchor)
 
         total_count = max(1, len(self.assets))
-        score = 92.0
+        slot_snapshot = CandidateSnapshot(
+            input_candidates=list(self.assets),
+            final_candidates=[target_asset],
+            input_anchors=list(matching_input_anchors),
+            output_anchors=[slot_anchor] if slot_anchor is not None else [],
+            contributing_output_anchors=[slot_anchor] if slot_anchor is not None else [],
+            information_gain_bits=round(math.log2(total_count), 4) if total_count > 1 else 0.0,
+        )
+        slot_decision = RestorationDecision(
+            detected=True,
+            trigger_type="input_output_slot_restoration",
+            restored_fields=restored_fields,
+            reason="用户输入给出受限事实槽位上下文，模型短答补全槽位值，组合后还原受限事实。",
+        )
+        score_breakdown = self._build_score_breakdown(slot_snapshot, slot_decision)
+        score = score_breakdown["final_score"]
         key_summary = self._summarize_key_anchors(finding_anchors)
         if not key_summary:
             key_summary = [
@@ -2203,6 +2494,7 @@ class CFAScoreEngine:
                 input_candidate_count=total_count,
                 final_candidate_count=1,
                 information_gain_bits=round(math.log2(total_count), 4) if total_count > 1 else 0.0,
+                score_breakdown=score_breakdown,
             )
         ]
 
